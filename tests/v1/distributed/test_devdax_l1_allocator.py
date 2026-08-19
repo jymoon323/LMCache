@@ -7,11 +7,13 @@ manager wiring while keeping CI portable.
 """
 
 # Standard
+from pathlib import Path
 from typing import Any, cast
 import argparse
 import gc
 import json
 import os
+import stat
 
 # Third Party
 import pytest
@@ -53,6 +55,19 @@ def _make_mmap_file(
     with open(path, "wb") as f:
         f.truncate(size)
     return str(path)
+
+
+def _open_fd_count(path: str) -> int:
+    """Count this process's open descriptors that resolve to ``path``."""
+    target = os.path.realpath(path)
+    count = 0
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{name}") == target:
+                count += 1
+        except OSError:
+            continue
+    return count
 
 
 def _key(seed: int = 0) -> ObjectKey:
@@ -235,6 +250,103 @@ def test_devdax_allocator_uses_mmap_backing_file(tmp_path):
 
     with open(path, "rb") as f:
         assert f.read(4096) == bytes([0x5A]) * 4096
+
+
+def test_regular_file_named_like_dax_ignores_dax_sysfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mmap file uses fstat capacity and ignores unrelated DAX sysfs."""
+    sysfs_root = tmp_path / "sysfs"
+    dax_sysfs = sysfs_root / "dax0.0"
+    dax_sysfs.mkdir(parents=True)
+    (dax_sysfs / "align").write_text("8192")
+    (dax_sysfs / "size").write_text("8192")
+    monkeypatch.setattr(
+        "lmcache.v1.memory_allocators.devdax_memory_allocator._DAX_SYSFS_ROOT",
+        str(sysfs_root),
+    )
+
+    path = _make_mmap_file(tmp_path, size=4096, name="dax0.0")
+    allocator = DevDaxMemoryAllocator(
+        size=4096,
+        device_path=path,
+        align_bytes=4096,
+    )
+    try:
+        # A regular file's capacity is its fstat size: an oversize runtime add
+        # is rejected up front and leaves the pool unchanged.
+        small = _make_mmap_file(tmp_path, size=4096, name="small.bin")
+        with pytest.raises(RuntimeError, match="exceeds.*capacity"):
+            allocator.add_device(small, 8192)
+        assert [s.device_path for s in allocator.arena_statuses()] == [path]
+        assert _open_fd_count(small) == 0
+    finally:
+        allocator.close()
+
+
+def test_character_device_uses_dax_sysfs_capacity_and_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A character-device mapping uses its DAX sysfs size and alignment."""
+    sysfs_root = tmp_path / "sysfs"
+    devices = {
+        "dax0.0": (8192, 4096),
+        "dax0.1": (4096, 4096),
+        "dax0.2": (8192, 8192),
+    }
+    for name, (size, align) in devices.items():
+        dax_sysfs = sysfs_root / name
+        dax_sysfs.mkdir(parents=True)
+        (dax_sysfs / "size").write_text(str(size))
+        (dax_sysfs / "align").write_text(str(align))
+
+    monkeypatch.setattr(
+        "lmcache.v1.memory_allocators.devdax_memory_allocator._DAX_SYSFS_ROOT",
+        str(sysfs_root),
+    )
+    primary = _make_mmap_file(tmp_path, size=8192, name="dax0.0")
+    capacity_limited = _make_mmap_file(tmp_path, size=8192, name="dax0.1")
+    strictly_aligned = _make_mmap_file(tmp_path, size=8192, name="dax0.2")
+    simulated_paths = {primary, capacity_limited, strictly_aligned}
+    real_fstat = os.fstat
+
+    def character_device_fstat(fd: int) -> os.stat_result:
+        # Only descriptors opened on these three mapping files impersonate DAX
+        # character device; every other caller keeps the real fstat result.
+        fd_status = real_fstat(fd)
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            return fd_status
+        if target not in simulated_paths:
+            return fd_status
+        fields = list(fd_status)
+        fields[stat.ST_MODE] = stat.S_IFCHR | 0o600
+        fields[stat.ST_SIZE] = 0
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(
+        "lmcache.v1.memory_allocators.devdax_memory_allocator.os.fstat",
+        character_device_fstat,
+    )
+
+    allocator = DevDaxMemoryAllocator(
+        size=4096,
+        device_path=primary,
+        align_bytes=4096,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="exceeds.*capacity"):
+            allocator.add_device(capacity_limited, 8192)
+        with pytest.raises(ValueError, match="multiple of the device alignment"):
+            allocator.add_device(strictly_aligned, 4096)
+        # Both rejections happen before mmap: the pool is untouched and the
+        # descriptor opened for validation is released.
+        assert [s.device_path for s in allocator.arena_statuses()] == [primary]
+        assert _open_fd_count(capacity_limited) == 0
+        assert _open_fd_count(strictly_aligned) == 0
+    finally:
+        allocator.close()
 
 
 def test_devdax_allocator_registers_cuda_host_mapping(tmp_path, monkeypatch):

@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Union
 import ctypes
 import mmap
 import os
+import stat
 import threading
 
 # Third Party
@@ -27,6 +28,32 @@ from lmcache.v1.memory_management import (
     logger,
 )
 import lmcache.v1.memory_management as memory_management
+
+_DAX_SYSFS_ROOT = "/sys/bus/dax/devices"
+
+
+def _dax_sysfs_attr_int(device_path: str, attribute: str) -> int:
+    """Best-effort read of an integer dax sysfs attribute for a device.
+
+    Character devices report ``st_size == 0``, so capacity and alignment for
+    real ``/dev/daxX.Y`` devices come from ``/sys/bus/dax/devices/daxX.Y/``.
+
+    Args:
+        device_path: Device path, e.g. ``/dev/dax1.0``.
+        attribute: Attribute file name, e.g. ``size`` or ``align``.
+
+    Returns:
+        The attribute value, or 0 when the attribute is unavailable (non-dax
+        path, missing sysfs entry, or unreadable content).
+    """
+    name = os.path.basename(device_path)
+    if not name.startswith("dax"):
+        return 0
+    try:
+        with open(os.path.join(_DAX_SYSFS_ROOT, name, attribute)) as f:
+            return int(f.read().strip(), 0)
+    except (OSError, ValueError):
+        return 0
 
 
 class DevDaxArenaState(Enum):
@@ -232,16 +259,66 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
             return self._arenas[0].allocator.address_manager
         return None
 
+    def _device_capacity_bytes(
+        self, device_path: str, fd_status: os.stat_result
+    ) -> int:
+        """Return the device capacity in bytes, or 0 when undeterminable.
+
+        Use the size reported by ``fstat`` when available. Device-DAX character
+        devices normally report ``st_size == 0``, so their capacity falls back
+        to the DAX sysfs ``size`` attribute.
+        """
+        capacity = fd_status.st_size
+        if capacity <= 0 and stat.S_ISCHR(fd_status.st_mode):
+            capacity = _dax_sysfs_attr_int(device_path, "size")
+        return capacity
+
     def _open_devdax_mapping(
         self,
         device_path: str,
         size: int,
     ) -> tuple[int, mmap.mmap, Any, torch.Tensor]:
+        """Validate and map one Device-DAX arena in a single attempt.
+
+        Generic arguments are validated before opening the path. A single
+        ``O_RDWR`` open then backs type detection, capacity and DAX sysfs
+        alignment checks, and the returned mapping, so the range that was
+        validated is the range that gets mapped. DAX sysfs attributes are
+        applied only when the opened fd identifies a character device, rather
+        than relying on the path basename alone.
+
+        Args:
+            device_path: Path to the Device-DAX device.
+            size: Number of bytes to map.
+
+        Returns:
+            The opened fd, the shared writable mmap, the ctypes view exported
+            from the mmap, and a flat ``torch.uint8`` tensor over it.
+
+        Raises:
+            ValueError: If an argument is invalid or the size violates the
+                device's advertised alignment.
+            RuntimeError: If the requested size exceeds the device capacity.
+            OSError: If the device cannot be opened or mapped read-write.
+        """
+        if not device_path:
+            raise ValueError("device_path must be a non-empty string")
+        if size <= 0:
+            raise ValueError("size_in_bytes must be > 0")
         fd: int | None = None
         mmap_obj: mmap.mmap | None = None
         try:
             fd = os.open(device_path, os.O_RDWR)
-            capacity = os.fstat(fd).st_size
+            fd_status = os.fstat(fd)
+            if stat.S_ISCHR(fd_status.st_mode):
+                align = _dax_sysfs_attr_int(device_path, "align")
+                if align > 0 and size % align != 0:
+                    raise ValueError(
+                        f"size ({size}) must be a multiple of the device "
+                        f"alignment ({align})"
+                    )
+
+            capacity = self._device_capacity_bytes(device_path, fd_status)
             if capacity > 0 and size > capacity:
                 raise RuntimeError(
                     f"l1 devdax size ({size} bytes) exceeds "
@@ -287,6 +364,8 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
             The newly mapped arena.
 
         Raises:
+            ValueError: If the mapping arguments are invalid or the size
+                violates the device's advertised alignment.
             RuntimeError: If the device capacity is smaller than ``size``.
             OSError: If the device cannot be opened or mapped.
         """
@@ -722,15 +801,12 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
 
         Raises:
             ValueError: If ``device_path`` is empty, ``size_in_bytes`` is not
-                positive, or the device is already mapped.
+                positive, the device is already mapped, or the mapping violates
+                the device's advertised alignment.
             RuntimeError: If the allocator is closed or the device capacity is
                 smaller than ``size_in_bytes``.
             OSError: If the device cannot be opened or mapped.
         """
-        if not device_path:
-            raise ValueError("device_path must be a non-empty string")
-        if size_in_bytes <= 0:
-            raise ValueError("size_in_bytes must be > 0")
         with self.host_mem_lock:
             if self._unregistered:
                 raise RuntimeError(

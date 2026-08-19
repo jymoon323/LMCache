@@ -95,10 +95,13 @@ The manager and allocator expose the same contract:
 
 Add:
 
-1. Validate the path is non-empty, the size is positive, the allocator is not
-   closed, and the path is not already mapped.
-2. Map the device: `open(O_RDWR)`, capacity check via `fstat.st_size`,
-   `mmap(MAP_SHARED, RW)`; build a `TensorMemoryAllocator`; best-effort pin.
+1. Reject if the allocator is closed or the path is already mapped.
+2. Map the device -- the mapping attempt itself validates the request
+   (non-empty path, positive size, and the device's advertised sysfs alignment)
+   and acquires the resources: a single `open(O_RDWR)` whose
+   fd backs both the capacity check (`fstat.st_size`, dax sysfs fallback) and
+   the `mmap(MAP_SHARED, RW)`; then build a `TensorMemoryAllocator`;
+   best-effort pin.
 3. Append the arena as `active` and non-primary. It is immediately available as
    overflow. Existing allocations are untouched.
 
@@ -126,7 +129,9 @@ supported here; see Current Limits.
 
 Configure the initial Device-DAX device when the server starts, either with the
 MP server CLI flag `--l1-devdax-path /dev/dax0.0` (the mapped size follows the
-L1 size settings) or programmatically:
+L1 size settings) or programmatically. The Device-DAX namespace must already
+exist and expose the requested capacity; namespace provisioning remains the
+operator's responsibility.
 
 ```python
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
@@ -167,14 +172,15 @@ A `DRAINING` device accepts no new allocations, keeps serving reads for the KV
 entries already on it, and unmaps automatically once the last of them is freed
 (deleted or evicted). Poll `get_arena_statuses()` until the path disappears
 from the list; `active_allocations` on the draining entry shows how many
-allocations still gate the unmap. Calling `remove_device` again on a draining
-path is safe and returns the current status.
+allocations still gate the unmap. Calling `remove_device` again while the path
+is still draining is safe and returns the current status; once the arena has
+been unmapped the path is no longer known and a repeat is rejected.
 
 `add_device` rejects paths that are already mapped, and `remove_device`
 rejects the primary arena (the initial device in pure Device-DAX mode); both
-raise `ValueError`. The device must already exist and be readable and
-writable; runtime reconfigure does not provision DAX namespaces (see Current
-Limits).
+raise `ValueError`. The Device-DAX path must already exist, be readable and
+writable, and expose enough capacity. Runtime reconfigure does not provision
+or resize DAX namespaces (see Current Limits).
 
 ## Thread Safety
 
@@ -193,6 +199,12 @@ the arena buffer, and the ctypes array) is released before `mmap.close()`,
 because CPython refuses to close a buffer that still has exported pointers.
 `mmap` dups the underlying file descriptor, so unmap releases both the opened fd
 and the mmap's dup.
+
+The allocator identifies the opened device with `fstat`. Device-DAX character
+devices normally report `st_size == 0`, so capacity and alignment come from
+basename-derived `/sys/bus/dax/devices/<name>/{size,align}` attributes when
+available. These DAX sysfs checks are gated on the opened fd's character-device
+type rather than on the path basename alone.
 
 CUDA host-memory registration (pinning) is per-arena and best-effort; a pin
 failure is logged and the arena falls back to pageable host copies.
@@ -235,8 +247,8 @@ real `/dev/dax` devices via `LMCACHE_TEST_DEVDAX_L1_PATHS`.
   live requests read and write, so relocation requires hooking L1 eviction.
 - The primary arena in pure Device-DAX mode cannot be removed at runtime.
 - Existing arenas cannot be resized; the pool grows and shrinks by whole arenas
-  (add / remove only).
-- Runtime reconfigure maps and unmaps already-provisioned devices; it does not
-  perform kernel-level CXL or DAX reconfiguration.
+  (`add_device` / `remove_device`).
+- Runtime reconfigure maps and unmaps already-provisioned Device-DAX devices;
+  it does not perform kernel-level CXL/DAX namespace reconfiguration.
 - No HTTP control surface yet; the reconfigure methods are the programmatic
   entry point.
