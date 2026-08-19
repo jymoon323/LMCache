@@ -39,9 +39,14 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.memory_manager.reconfiguration import (
+    L1ReconfigureError,
+)
+from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxArenaState,
     DevDaxMemoryAllocator,
+    DevDaxRemoveMode,
 )
 from lmcache.v1.multiprocess.config import add_mp_server_args
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -454,6 +459,66 @@ def test_l1_manager_round_trip_on_devdax_mapping(tmp_path):
 
     with open(path, "rb") as f:
         assert f.read(1) == bytes([0x23])
+
+
+def test_storage_manager_routes_l1_devdax_reconfigure(tmp_path: Path) -> None:
+    primary = _make_mmap_file(tmp_path, size=4096, name="primary.bin")
+    extra = _make_mmap_file(tmp_path, size=4096, name="extra.bin")
+    storage_manager = StorageManager(
+        StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=4096,
+                    use_lazy=False,
+                    shm_name="",
+                    align_bytes=4096,
+                    devdax_path=primary,
+                )
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+        )
+    )
+    try:
+        (primary_status,) = storage_manager.get_l1_devdax_arena_statuses()
+        assert primary_status.device_path == primary
+        assert primary_status.is_primary is True
+
+        added = storage_manager.add_l1_devdax_device(extra, 4096)
+        assert added.device_path == extra
+        assert added.state == DevDaxArenaState.ACTIVE
+
+        removed = storage_manager.remove_l1_devdax_device(extra, DevDaxRemoveMode.DRAIN)
+        assert removed.device_path == extra
+        assert removed.state == DevDaxArenaState.REMOVED
+
+        # Once unmapped the path is unknown: the allocator lookup miss is
+        # translated into the HTTP-mappable 404, not a 409 state conflict.
+        with pytest.raises(L1ReconfigureError) as lookup_miss:
+            storage_manager.remove_l1_devdax_device(extra, DevDaxRemoveMode.DRAIN)
+        assert lookup_miss.value.status_code == 404
+    finally:
+        storage_manager.close()
+
+
+def test_storage_manager_l1_devdax_reconfigure_rejects_cpu_l1() -> None:
+    storage_manager = StorageManager(
+        StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=4096,
+                    use_lazy=False,
+                    shm_name="",
+                    align_bytes=4096,
+                )
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+        )
+    )
+    try:
+        with pytest.raises(L1ReconfigureError, match="Device-DAX"):
+            storage_manager.get_l1_devdax_arena_statuses()
+    finally:
+        storage_manager.close()
 
 
 def test_devdax_l1_memory_manager_spills_from_dram_to_devdax(tmp_path):
@@ -1008,7 +1073,7 @@ def test_remove_primary_arena_rejected(tmp_path):
     primary = _make_mmap_file(tmp_path, size=4096)
     manager = _pure_devdax_manager(primary)
 
-    with pytest.raises(ValueError, match="primary"):
+    with pytest.raises(L1ReconfigureError, match="primary"):
         manager.remove_device(primary)
 
     # The primary arena survives the rejected removal.
@@ -1022,7 +1087,7 @@ def test_add_duplicate_device_rejected(tmp_path):
 
     extra = _make_mmap_file(tmp_path, size=4096, name="extra.bin")
     manager.add_device(extra, 4096)
-    with pytest.raises(ValueError, match="already mapped"):
+    with pytest.raises(L1ReconfigureError, match="already mapped"):
         manager.add_device(extra, 4096)
 
     assert len(manager.get_arena_statuses()) == 2
@@ -1033,9 +1098,9 @@ def test_add_device_validates_arguments(tmp_path):
     primary = _make_mmap_file(tmp_path, size=4096)
     manager = _pure_devdax_manager(primary)
 
-    with pytest.raises(ValueError, match="device_path"):
+    with pytest.raises(L1ReconfigureError, match="device_path"):
         manager.add_device("", 4096)
-    with pytest.raises(ValueError, match="size_in_bytes"):
+    with pytest.raises(L1ReconfigureError, match="size_in_bytes"):
         manager.add_device(str(tmp_path / "unused.bin"), 0)
 
     manager.close()

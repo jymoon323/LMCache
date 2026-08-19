@@ -56,6 +56,14 @@ def _dax_sysfs_attr_int(device_path: str, attribute: str) -> int:
         return 0
 
 
+class DevDaxNotMappedError(ValueError):
+    """No Device-DAX arena is mapped from the requested device path.
+
+    A specialized ``ValueError`` that lets the manager distinguish a lookup
+    miss from other invalid allocator requests.
+    """
+
+
 class DevDaxArenaState(Enum):
     """Lifecycle state of one Device-DAX arena in the L1 pool.
 
@@ -444,12 +452,12 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         """Return the arena mapped at ``device_path``. Caller holds the lock.
 
         Raises:
-            ValueError: If no arena is mapped at ``device_path``.
+            DevDaxNotMappedError: If no arena is mapped at ``device_path``.
         """
         for arena in self._arenas:
             if arena.device_path == device_path:
                 return arena
-        raise ValueError(f"no Device-DAX arena mapped at {device_path}")
+        raise DevDaxNotMappedError(f"no Device-DAX arena mapped at {device_path}")
 
     def _arena_for_obj_locked(self, memory_obj: MemoryObj) -> _DevDaxArena:
         """Return the arena that owns ``memory_obj``. Caller holds the lock.

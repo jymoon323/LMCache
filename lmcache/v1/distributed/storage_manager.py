@@ -57,6 +57,10 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
 )
+from lmcache.v1.memory_allocators.devdax_memory_allocator import (
+    DevDaxArenaStatus,
+    DevDaxRemoveMode,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -897,6 +901,58 @@ class StorageManager:
             Tuple of ``(used_bytes, total_bytes)``.
         """
         return self._l1_manager.get_memory_usage()
+
+    # L1 reconfiguration APIs
+    def get_l1_devdax_arena_statuses(self) -> list[DevDaxArenaStatus]:
+        """Return runtime status for every Device-DAX L1 arena.
+
+        Returns:
+            One status per mapped arena, in pool order.
+
+        Raises:
+            L1ReconfigureError: If L1 is not Device-DAX backed.
+        """
+        return self._l1_manager.get_devdax_arena_statuses()
+
+    def add_l1_devdax_device(
+        self,
+        device_path: str,
+        size_in_bytes: int,
+    ) -> DevDaxArenaStatus:
+        """Add a Device-DAX device to the L1 arena pool.
+
+        Args:
+            device_path: Path of the Device-DAX device to map.
+            size_in_bytes: Number of bytes to map.
+
+        Returns:
+            Status of the newly added arena.
+
+        Raises:
+            L1ReconfigureError: If L1 is not Device-DAX backed or the request
+                cannot be applied.
+        """
+        return self._l1_manager.add_devdax_device(device_path, size_in_bytes)
+
+    def remove_l1_devdax_device(
+        self,
+        device_path: str,
+        mode: DevDaxRemoveMode = DevDaxRemoveMode.DRAIN,
+    ) -> DevDaxArenaStatus:
+        """Remove a Device-DAX device from the L1 arena pool.
+
+        Args:
+            device_path: Path of the mapped Device-DAX device.
+            mode: Removal strategy. Only drain mode is currently supported.
+
+        Returns:
+            Status of the arena after the removal request.
+
+        Raises:
+            L1ReconfigureError: If L1 is not Device-DAX backed or the request
+                cannot be applied.
+        """
+        return self._l1_manager.remove_devdax_device(device_path, mode)
 
     def get_usage_bytes_by_cache_salt(self) -> dict[str, int]:
         """Aggregate ``cache_salt`` byte usage across every L2 adapter.

@@ -203,6 +203,25 @@ compatibility with the vLLM-embedded API server.
      - ``/reconfigure/l2/{backend}/{operation}``
      - Apply one runtime reconfiguration operation to a backend adapter.
 
+**Runtime L1 reconfiguration (Device-DAX)**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 35 55
+
+   * - Method
+     - Path
+     - Purpose
+   * - GET
+     - ``/reconfigure/l1/dax/status``
+     - Report every Device-DAX L1 arena with usage and lifecycle state.
+   * - POST
+     - ``/reconfigure/l1/dax/add``
+     - Map an additional Device-DAX device.
+   * - POST
+     - ``/reconfigure/l1/dax/remove``
+     - Remove one mapped Device-DAX L1 device (currently drain mode only).
+
 **Observability**
 
 .. list-table::
@@ -1299,6 +1318,108 @@ dict). A successful DAX ``add`` looks like:
 
 See :doc:`/kv_cache/storage_backends/dax` for detailed request examples,
 mode semantics, and validation guidance.
+
+Runtime L1 Reconfiguration (Device-DAX)
+---------------------------------------
+
+Tier-first routes for the Device-DAX L1 arena pool (``--l1-devdax-path``).
+Unlike the L2 routes above, these are fixed four-segment paths under the
+``l1`` tier segment -- disjoint from the parametric L2 family under
+``/reconfigure/l2`` -- and they operate on
+the single Device-DAX L1 memory manager rather than on an adapter list, so
+there is no ``adapter_index``.
+
+The ``device_path`` identifies an existing Device-DAX character device.
+LMCache maps an already-provisioned namespace but does not provision or resize
+it. Before ``add``, ensure that the namespace capacity covers the requested
+mapping.
+
+**HTTP status codes:**
+
+- ``200``: request completed successfully.
+- ``400``: an invalid ``size`` value.
+- ``404``: the device requested by ``remove`` is not mapped.
+- ``409``: L1 is not Device-DAX backed, the device state conflicts with the
+  operation, or mapping validation fails.
+- ``422``: malformed JSON or a request body that fails schema validation.
+- ``503``: engine not initialized.
+
+``GET /reconfigure/l1/dax/status``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Report every Device-DAX L1 arena with its usage and lifecycle state.
+
+**Response** (``200 OK``):
+
+.. code-block:: json
+
+    {
+      "arenas": [
+        {
+          "device_path": "/dev/dax1.1",
+          "size_in_bytes": 17179869184,
+          "used_bytes": 4294967296,
+          "free_bytes": 12884901888,
+          "active_allocations": 2048,
+          "state": "active",
+          "is_primary": false
+        }
+      ]
+    }
+
+``POST /reconfigure/l1/dax/add``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Map an additional already-provisioned Device-DAX device into the pool as
+overflow capacity. Existing allocations are untouched.
+
+**Request body:** ``device_path`` (string); ``size`` (integer byte count or
+a string like ``"16GiB"``).
+
+**Response** (``200 OK``): ``{"added": <arena>}`` with the new arena's
+status.
+
+**Example:**
+
+.. code-block:: bash
+
+    curl -s -X POST http://localhost:8080/reconfigure/l1/dax/add \
+        -H 'Content-Type: application/json' \
+        -d '{"device_path": "/dev/dax1.2", "size": "16GiB"}'
+
+``POST /reconfigure/l1/dax/remove``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Remove a device. Currently, only drain mode is supported: its arena stops
+accepting new allocations and unmaps automatically once its live allocations
+are freed. Repeating the call while the path is still draining is safe and
+returns the current status; once the arena has been unmapped the path is no
+longer known and a repeat is rejected. The primary arena of a pure Device-DAX
+configuration cannot be removed.
+
+**Request body:** ``device_path`` (string); ``mode`` (``drain``, optional,
+default ``drain``).
+
+**Response** (``200 OK``):
+
+.. code-block:: json
+
+    {
+      "removed": {
+        "device_path": "/dev/dax1.2",
+        "arenas": [
+          {
+            "device_path": "/dev/dax1.2",
+            "state": "draining",
+            "active_allocations": 3,
+            "size_in_bytes": 17179869184,
+            "used_bytes": 6291456,
+            "free_bytes": 17173577728,
+            "is_primary": false
+          }
+        ]
+      }
+    }
 
 Observability
 -------------
