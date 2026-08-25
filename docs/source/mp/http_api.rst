@@ -1334,6 +1334,12 @@ LMCache maps an already-provisioned namespace but does not provision or resize
 it. Before ``add``, ensure that the namespace capacity covers the requested
 mapping.
 
+.. note::
+
+   Runtime add/remove updates only the server-local arena pool. These operations
+   do not update the boot-configured L1 capacity declaration used by the
+   coordinator's ``/instances/usage`` API.
+
 **HTTP status codes:**
 
 - ``200``: request completed successfully.

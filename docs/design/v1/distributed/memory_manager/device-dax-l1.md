@@ -267,6 +267,10 @@ the last cached entry is deleted. It accepts real `/dev/dax` devices via
   (`add_device` / `remove_device`).
 - Runtime reconfigure maps and unmaps already-provisioned Device-DAX devices;
   it does not perform kernel-level CXL/DAX namespace reconfiguration.
+- Runtime add/remove updates only the server-local arena pool and its live
+  `get_memory_usage()` total. The boot-configured `memory_configured_bytes` and
+  coordinator `/instances/usage` capacity declaration are not updated by these
+  operations.
 - The HTTP control surface is `/reconfigure/l1/dax/*`
   (`l1_reconfigure_api.py`); the `L1Manager` delegation methods remain the
   programmatic entry point.
