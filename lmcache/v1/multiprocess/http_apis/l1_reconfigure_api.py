@@ -35,6 +35,12 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 
+_L1_RECONFIGURE_DISABLED_ERROR = (
+    "runtime L1 Device-DAX reconfiguration is disabled while coordinator "
+    "registration is enabled: L1 capacity changes are not yet propagated to "
+    "the coordinator"
+)
+
 
 class _StorageManagerLike(Protocol):
     def get_l1_devdax_arena_statuses(self) -> list[DevDaxArenaStatus]: ...
@@ -68,6 +74,25 @@ class L1DaxRemoveRequest(BaseModel):
 
     device_path: str
     mode: DevDaxRemoveMode = DevDaxRemoveMode.DRAIN
+
+
+# TODO: Remove this guard once runtime L1 capacity changes are propagated
+# to the coordinator.
+def _ensure_l1_reconfigure_allowed(request: Request) -> None:
+    """Reject add/remove while this MP server registers with a coordinator.
+
+    Args:
+        request: Incoming request whose application state holds server configs.
+
+    Raises:
+        L1ReconfigureError: If coordinator registration is enabled.
+    """
+    configs = getattr(request.app.state, "configs", None)
+    if not isinstance(configs, dict):
+        return
+    coordinator_config = configs.get("coordinator")
+    if getattr(coordinator_config, "url", ""):
+        raise L1ReconfigureError(409, _L1_RECONFIGURE_DISABLED_ERROR)
 
 
 def _get_storage_manager(request: Request) -> _StorageManagerLike | JSONResponse:
@@ -169,6 +194,7 @@ async def l1_dax_add(
     except ValueError:
         return JSONResponse(status_code=400, content={"error": SIZE_ERROR})
     try:
+        _ensure_l1_reconfigure_allowed(request)
         status = storage_manager.add_l1_devdax_device(body.device_path, size_bytes)
     except L1ReconfigureError as exc:
         logger.warning("l1 dax add failed for %s: %s", body.device_path, exc)
@@ -194,6 +220,7 @@ async def l1_dax_remove(
     if isinstance(storage_manager, JSONResponse):
         return storage_manager
     try:
+        _ensure_l1_reconfigure_allowed(request)
         status = storage_manager.remove_l1_devdax_device(body.device_path, body.mode)
     except L1ReconfigureError as exc:
         logger.warning("l1 dax remove failed for %s: %s", body.device_path, exc)

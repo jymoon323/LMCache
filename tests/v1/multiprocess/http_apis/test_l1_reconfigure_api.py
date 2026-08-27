@@ -17,6 +17,7 @@ from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxArenaStatus,
     DevDaxRemoveMode,
 )
+from lmcache.v1.multiprocess.config import CoordinatorConfig
 from lmcache.v1.multiprocess.http_apis.l1_reconfigure_api import router
 
 _PRIMARY = "/dev/dax0.0"
@@ -89,11 +90,17 @@ class _FakeEngine:
     storage_manager: _FakeStorageManager
 
 
-def _client(sm: _FakeStorageManager) -> TestClient:
+def _client(
+    sm: _FakeStorageManager,
+    *,
+    coordinator_config: CoordinatorConfig | None = None,
+) -> TestClient:
     """Create a test client whose engine exposes ``sm``.
 
     Args:
         sm: Fake storage manager receiving route delegation calls.
+        coordinator_config: Optional coordinator configuration exposed through
+            application state.
 
     Returns:
         A client with only the L1 reconfigure router registered.
@@ -101,13 +108,19 @@ def _client(sm: _FakeStorageManager) -> TestClient:
     app = FastAPI()
     app.include_router(router)
     app.state.engine = _FakeEngine(storage_manager=sm)
+    if coordinator_config is not None:
+        app.state.configs = {"coordinator": coordinator_config}
     return TestClient(app)
 
 
 def test_l1_dax_routes_requests_to_storage_manager() -> None:
     """The HTTP surface translates requests into StorageManager calls."""
     storage_manager = _FakeStorageManager()
-    client = _client(storage_manager)
+    # URL alone controls the guard; event reporting without a URL does not.
+    client = _client(
+        storage_manager,
+        coordinator_config=CoordinatorConfig(event_reporting=True),
+    )
 
     response = client.get("/reconfigure/dax/l1/status")
     assert response.status_code == 200
@@ -138,6 +151,32 @@ def test_l1_dax_routes_requests_to_storage_manager() -> None:
         ("add", (_EXTRA, _MAPPED_BYTES)),
         ("remove", (_EXTRA, DevDaxRemoveMode.DRAIN)),
     ]
+
+
+def test_l1_dax_reconfigure_rejected_with_coordinator_registration() -> None:
+    """Coordinator registration keeps status available and blocks add/remove."""
+    storage_manager = _FakeStorageManager()
+    client = _client(
+        storage_manager,
+        coordinator_config=CoordinatorConfig(url="http://coordinator:9300"),
+    )
+
+    assert client.get("/reconfigure/dax/l1/status").status_code == 200
+
+    add = client.post(
+        "/reconfigure/dax/l1/add",
+        json={"device_path": _EXTRA, "size": _MAPPED_BYTES},
+    )
+    remove = client.post(
+        "/reconfigure/dax/l1/remove",
+        json={"device_path": _EXTRA},
+    )
+
+    assert add.status_code == 409
+    assert remove.status_code == 409
+    assert "coordinator registration is enabled" in add.json()["error"]
+    assert remove.json() == add.json()
+    assert storage_manager.calls == [("status", ())]
 
 
 def test_l1_dax_reconfigure_error_status_is_preserved() -> None:

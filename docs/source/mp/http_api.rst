@@ -1340,17 +1340,22 @@ mapping.
 
 .. note::
 
-   Runtime add/remove updates only the server-local arena pool. These operations
-   do not update the boot-configured L1 capacity declaration used by the
-   coordinator's ``/instances/usage`` API.
+   Runtime add/remove updates only the server-local arena pool; the
+   boot-configured L1 capacity declaration used by the coordinator's
+   ``/instances/usage`` API is not updated yet. While coordinator registration
+   is enabled (``--coordinator-url``), ``add`` and ``remove`` are therefore
+   rejected with ``409`` so the coordinator's capacity view cannot diverge
+   from the arena pool; ``status`` stays available. The restriction can be
+   lifted once runtime L1 capacity changes are propagated to the coordinator.
 
 **HTTP status codes:**
 
 - ``200``: request completed successfully.
 - ``400``: an invalid ``size`` value.
 - ``404``: the device requested by ``remove`` is not mapped.
-- ``409``: L1 is not Device-DAX backed, the device state conflicts with the
-  operation, or mapping validation fails.
+- ``409``: runtime reconfiguration is disabled while coordinator registration
+  is enabled, L1 is not Device-DAX backed, the device state conflicts with
+  the operation, or mapping validation fails.
 - ``422``: malformed JSON or a request body that fails schema validation.
 - ``503``: engine not initialized.
 

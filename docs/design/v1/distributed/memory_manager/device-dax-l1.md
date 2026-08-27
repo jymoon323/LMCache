@@ -49,9 +49,11 @@ Handlers stay thin -- request-shape validation (422 schema / 400 size values)
 happens at the HTTP layer, domain status-code decisions (404 lookup miss, 409
 state conflict or non-Device-DAX L1) come from the manager via
 `L1ReconfigureError`, the HTTP resolver answers 503 before engine or storage
-manager initialization, and arena mechanics stay in the allocator. The current
-L1 surface fixes `dax` as the backend and `l1` as the tier segment, keeping it
-disjoint from the parametric L2 family (`/reconfigure/{backend}/l2/*`).
+manager initialization, and arena mechanics stay in the allocator. The HTTP
+layer also applies a temporary coordinator-registration guard to `add` and
+`remove`. The current L1 surface fixes `dax` as the backend and `l1` as the tier
+segment, keeping it disjoint from the parametric L2 family
+(`/reconfigure/{backend}/l2/*`).
 Additional L1 backends are not exposed by this API and require corresponding
 routing and delegation support. A URL that omits the tier segment, such as
 `/reconfigure/dax/status`, returns `404`. See
@@ -272,20 +274,14 @@ the last cached entry is deleted. It accepts real `/dev/dax` devices via
 - Runtime reconfigure maps and unmaps already-provisioned Device-DAX devices;
   it does not perform kernel-level CXL/DAX namespace reconfiguration.
 - Runtime add/remove updates only the server-local arena pool and its live
-  `get_memory_usage()` total. The boot-configured `memory_configured_bytes` and
-  coordinator `/instances/usage` capacity declaration are not updated by these
-  operations.
-- The HTTP control surface is `/reconfigure/dax/l1/*`
-  (`l1_reconfigure_api.py`); the `L1Manager` delegation methods remain the
-  programmatic entry point.
-
-## Open Decisions / Deferred Work
-
-Decisions intentionally left to the upstream RFC; the behavior described here
-is what the code does today.
-
-- **Coordinator-owned shared pools (upstream RFC #4307).** These endpoints assume
-  the server privately owns its Device-DAX L1. In a shared-pool deployment the
-  region lifecycle belongs to the coordinator, so local reconfiguration must be
-  refused there. Guard insertion point: the public L1 Device-DAX methods on
-  `StorageManager`; not implemented until the shared-pool design lands upstream.
+  `get_memory_usage()` total; the boot-configured `memory_configured_bytes` and
+  the coordinator's `/instances/usage` capacity declaration are not updated.
+  While coordinator registration is enabled (`--coordinator-url`), the
+  MP HTTP `add`/`remove` handlers therefore reject requests with `409`
+  so capacity-changing requests through this control surface cannot make the
+  coordinator's view diverge from the arena pool; `status` stays available
+  because it does not change the pool. This restriction is scoped to the MP
+  HTTP API. Direct programmatic callers do not read the MP coordinator config
+  and are responsible for preserving coordinator capacity consistency. The
+  HTTP restriction can be lifted once runtime L1 capacity changes are
+  propagated to the coordinator.
