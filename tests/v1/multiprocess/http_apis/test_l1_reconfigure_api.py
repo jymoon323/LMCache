@@ -109,7 +109,7 @@ def test_l1_dax_routes_requests_to_storage_manager() -> None:
     storage_manager = _FakeStorageManager()
     client = _client(storage_manager)
 
-    response = client.get("/reconfigure/l1/dax/status")
+    response = client.get("/reconfigure/dax/l1/status")
     assert response.status_code == 200
     (arena,) = response.json()["arenas"]
     assert arena["device_path"] == _PRIMARY
@@ -117,7 +117,7 @@ def test_l1_dax_routes_requests_to_storage_manager() -> None:
     assert arena["is_primary"] is True
 
     response = client.post(
-        "/reconfigure/l1/dax/add",
+        "/reconfigure/dax/l1/add",
         json={"device_path": _EXTRA, "size": "4KiB"},
     )
     assert response.status_code == 200
@@ -125,7 +125,7 @@ def test_l1_dax_routes_requests_to_storage_manager() -> None:
     assert (added["device_path"], added["state"]) == (_EXTRA, "active")
 
     response = client.post(
-        "/reconfigure/l1/dax/remove",
+        "/reconfigure/dax/l1/remove",
         json={"device_path": _EXTRA},
     )
     assert response.status_code == 200
@@ -145,7 +145,7 @@ def test_l1_dax_reconfigure_error_status_is_preserved() -> None:
         raise_error=L1ReconfigureError(409, "mapping conflict")
     )
     response = _client(storage_manager).post(
-        "/reconfigure/l1/dax/add",
+        "/reconfigure/dax/l1/add",
         json={"device_path": _EXTRA, "size": _MAPPED_BYTES},
     )
 
@@ -162,20 +162,20 @@ def test_l1_dax_wire_validation() -> None:
     # The wire type is strict: a JSON boolean is a schema violation, never
     # silently coerced into a byte count.
     response = client.post(
-        "/reconfigure/l1/dax/add", json={"device_path": _EXTRA, "size": True}
+        "/reconfigure/dax/l1/add", json={"device_path": _EXTRA, "size": True}
     )
     assert response.status_code == 422
     assert "detail" in response.json()
     # A well-formed size string with a nonsense value is a 400 value error.
     response = client.post(
-        "/reconfigure/l1/dax/add", json={"device_path": _EXTRA, "size": "4Zi"}
+        "/reconfigure/dax/l1/add", json={"device_path": _EXTRA, "size": "4Zi"}
     )
     assert response.status_code == 400
     assert "error" in response.json()
     # The field is reserved for future remove strategies, but only the
     # currently implemented drain mode is accepted.
     response = client.post(
-        "/reconfigure/l1/dax/remove",
+        "/reconfigure/dax/l1/remove",
         json={"device_path": _EXTRA, "mode": "evict"},
     )
     assert response.status_code == 422
@@ -187,12 +187,12 @@ def test_l1_dax_backend_and_resolver_errors() -> None:
     cpu_manager = _FakeStorageManager(
         raise_error=L1ReconfigureError(409, "L1 is not Device-DAX backed")
     )
-    response = _client(cpu_manager).get("/reconfigure/l1/dax/status")
+    response = _client(cpu_manager).get("/reconfigure/dax/l1/status")
     assert response.status_code == 409
     assert "Device-DAX" in response.json()["error"]
 
     app = FastAPI()
     app.include_router(router)
-    response = TestClient(app).get("/reconfigure/l1/dax/status")
+    response = TestClient(app).get("/reconfigure/dax/l1/status")
     assert response.status_code == 503
     assert "engine" in response.json()["error"]
