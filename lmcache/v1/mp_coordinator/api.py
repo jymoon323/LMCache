@@ -31,7 +31,7 @@ class CacheEventType(str, Enum):
     ``STORE`` commits placements; ``DELETE`` removes them (owners report
     evictions as deletes); ``ACCESS`` refreshes recency without changing
     placement state. ``CONFIG`` carries no placement at all: it declares
-    one compartment's configured capacity, so the fleet view has a
+    one compartment's declared usable capacity, so the fleet view has a
     denominator for the bytes the other three report.
     """
 
