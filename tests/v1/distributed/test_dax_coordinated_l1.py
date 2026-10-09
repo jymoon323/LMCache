@@ -13,7 +13,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import Mock, PropertyMock
+from unittest.mock import Mock, PropertyMock, call
 import argparse
 import gc
 import json
@@ -22,6 +22,7 @@ import os
 import stat
 import struct
 import threading
+import time
 import traceback
 import weakref
 
@@ -789,6 +790,7 @@ def test_runtime_l2_add_is_rejected_before_adapter_creation(
 ) -> None:
     """DAX-Coordinated L1 rejects L2 additions before registering an adapter."""
     backend = Mock()
+    backend.staged_retrieve = None  # direct retrieve
     backend.client.get_memory_usage.return_value = (0, 64 << 20)
     backend.client.get_l1_memory_desc.return_value = L1MemoryDesc(0, 0, 4096)
     backend.client.report_status.return_value = {"is_healthy": True}
@@ -2318,6 +2320,432 @@ def test_zero_read_view_cache_limit_preserves_reads_without_retaining_views(
         _assert_success(owner.delete([key]))
 
 
+@pytest.mark.no_shared_allocator
+def test_staged_retrieve_config_preserves_layout_and_rejects_no_flush() -> None:
+    direct = _base_config()
+    assert not direct.staged_retrieve
+    staged = replace(direct, staged_retrieve=True)
+    assert staged.rank_placement == direct.rank_placement
+    with pytest.raises(ValueError, match="skip_payload_flush"):
+        replace(staged, skip_payload_flush=True)
+    for name in (
+        "staged_retrieve_slots",
+        "staged_retrieve_slot_bytes",
+        "staged_retrieve_copy_threads",
+    ):
+        for value in (0, -1, True, 1.5):
+            with pytest.raises(ValueError, match=name):
+                replace(staged, **{name: value})
+    assert direct.staged_retrieve_event_timeout_s == 30.0
+    assert direct.staged_retrieve_close_timeout_s == 30.0
+    for name in (
+        "staged_retrieve_event_timeout_s",
+        "staged_retrieve_close_timeout_s",
+    ):
+        for value in (0, -1, True, "30"):
+            with pytest.raises(ValueError, match=name):
+                replace(staged, **{name: value})
+        assert getattr(replace(staged, **{name: 5}), name) == 5
+        assert getattr(replace(staged, **{name: 0.5}), name) == 0.5
+
+
+def _staged_storage(
+    placement: DaxCoordinatedL1RankPlacementConfig, **overrides: object
+) -> StorageManager:
+    """Reader participant 1 with one 2 MiB staged retrieve slot by default."""
+    settings: dict[str, object] = {
+        "staged_retrieve": True,
+        "staged_retrieve_slots": 1,
+        "staged_retrieve_slot_bytes": 2 << 20,
+        "staged_retrieve_copy_threads": 2,
+    }
+    settings.update(overrides)
+    return _storage(_config(placement, 1, **settings))
+
+
+def _staged_retrieve_module(
+    storage: StorageManager,
+    keys: list[list[ObjectKey]],
+    monkeypatch: pytest.MonkeyPatch,
+    transfer: Callable[..., None],
+) -> tuple[LMCacheDrivenTransferModule, Mock, Mock, Mock]:
+    """Drive the public retrieve over real storage; pinning and GPU are emulated.
+
+    Each retrieve reads the single object group ``keys[0]``, so a test can
+    switch key sets between calls. ``transfer`` replaces the H2D enqueue.
+    Returns the module and the cache context, ``torch_dev`` and finish
+    callback mocks. The device's recorded completion event reports done
+    unless a test sets ``device.Event.return_value.query.return_value``.
+    """
+    # Standard
+    from unittest.mock import MagicMock
+
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1 import staged_retrieve
+    from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer_mod
+
+    context = SimpleNamespace(
+        chunk_size=256,
+        storage_manager=storage,
+        event_bus=MagicMock(),
+        resolve_obj_keys=lambda *_: [keys[0]],
+    )
+    module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
+    module._ctx = context
+    gpu = MagicMock()
+    gpu.lmcache_tokens_per_chunk = 256
+    gpu.max_batch_size = 2
+    gpu.calculate_num_blocks.return_value = 1
+    gpu.kv_layer_groups_manager = SimpleNamespace(
+        num_object_groups=1,
+        num_kernel_groups=1,
+        get_attn_desc=lambda: SimpleNamespace(
+            group_kinds=("attention",), num_chunks_in_sw=[-1]
+        ),
+        get_subchunk_sw_size_tokens=lambda _: 256,
+    )
+    event_backend = MagicMock()
+    event_backend.export_event.return_value = b"done"
+    module.get_and_touch_context_entry = lambda _: SimpleNamespace(
+        cache_context=gpu,
+        model_name=_MODEL,
+        event_backend=event_backend,
+    )
+    empty = torch.empty
+    monkeypatch.setattr(
+        staged_retrieve.torch,
+        "empty",
+        lambda *a, **kw: empty(
+            *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
+        ),
+    )
+    monkeypatch.setattr(
+        transfer_mod, "downsample_and_stage_block_ids", lambda _, ids: ids
+    )
+    device = MagicMock()
+    device.Event.return_value.query.return_value = True
+    monkeypatch.setattr(transfer_mod, "torch_dev", device)
+    finish_callback = Mock()
+    monkeypatch.setattr(transfer_mod, "submit_callback_to_stream", finish_callback)
+    monkeypatch.setattr(transfer_mod, "transfer_kv_per_object_group", transfer)
+    return module, gpu, device, finish_callback
+
+
+def _staged_retrieve(module: LMCacheDrivenTransferModule) -> tuple[bytes, bool]:
+    return module.retrieve(
+        SimpleNamespace(request_id="staged", cache_salt=None),
+        1,
+        [[0, 1, 2, 3]],
+        b"producer",
+    )
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("fail_enqueue", [False, True])
+def test_staged_public_retrieve_keeps_peer_reader_until_gather(
+    emulated_devices: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail_enqueue: bool,
+) -> None:
+    """Real native shared index + CPU copy; only pinning and GPU are emulated.
+
+    Readers are held while the batches are gathered and enqueued and are
+    released when the RPC returns, before the DMA completes; the bounce
+    slots stay in flight until their completion events are observed.
+    """
+    placement, _, _ = emulated_devices
+    owner = _client(_config(placement))
+    # Two slots: both batches of a retrieve are enqueued without waiting for
+    # the first batch's DMA, which this test keeps pending.
+    storage = _staged_storage(placement, staged_retrieve_slots=2)
+    keys = [_key(rank) for rank in range(4)]
+    copied = []
+
+    def enqueue(cache_context, block_ids, objects, **kwargs):
+        # Every enqueue runs with the readers of the whole request held.
+        assert all(result != Raw.SUCCESS for result, _ in owner.delete(keys).values())
+        assert storage.report_status()["l1_manager"]["active_read_reservations"] == 4
+        for obj, block in zip(objects, block_ids[0], strict=True):
+            assert obj.meta.address < 2 << 20
+            assert torch.all(obj.raw_tensor.view(torch.bfloat16) == block + 1)
+            copied.append(block)
+        if fail_enqueue:
+            raise RuntimeError("injected partial H2D")
+
+    module, _, device, finish_callback = _staged_retrieve_module(
+        storage, [keys], monkeypatch, enqueue
+    )
+    event = device.Event.return_value
+    in_flight = 1 if fail_enqueue else 2
+    try:
+        assert owner.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        backend = storage.dax_coordinated_l1_backend
+        assert backend is not None
+        assert backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        for _ in range(2):  # cold descriptor creation, then cached read views
+            _payload_values(
+                owner.reserve_write(keys, _layout()),
+                {key: rank + 1 for rank, key in enumerate(keys)},
+            )
+            _assert_success(owner.finish_write(keys))
+            results = backend.reserve_read(keys, 1)
+            assert all(error == L1Error.SUCCESS for error, _ in results.values())
+            del results
+            # The DMA stays pending until this test completes it below.
+            event.query.return_value = False
+            records = event.record.call_count
+            handle, success = _staged_retrieve(module)
+            assert handle == b"done"
+            assert success is not fail_enqueue
+            # One completion record per enqueue attempt, failed ones included.
+            assert event.record.call_count == records + in_flight
+            finish_callback.assert_not_called()
+            status = storage.report_status()["l1_manager"]
+            # The readers are gone although no DMA has completed.
+            assert status["active_read_reservations"] == 0
+            assert status["staged_retrieve"]["active_sessions"] == 0
+            assert status["staged_retrieve"]["in_flight_slots"] == in_flight
+            assert status["staged_retrieve"]["slots_in_use"] == in_flight
+            assert status["staged_retrieve"]["available_slots"] == 2 - in_flight
+            _assert_success(owner.delete(keys))
+            # The completions are observed at the next status report.
+            event.query.return_value = True
+            status = storage.report_status()["l1_manager"]["staged_retrieve"]
+            assert status["in_flight_slots"] == 0
+            assert status["slots_in_use"] == 0
+            assert status["available_slots"] == 2
+            assert status["quarantined_slots"] == 0
+    finally:
+        for record in caplog.records:
+            if record.exc_info and record.exc_info[2]:
+                traceback.clear_frames(record.exc_info[2])
+        caplog.clear()
+        gc.collect()
+        storage.close()
+        owner.close()
+    assert copied == ([0, 1] * 2 if fail_enqueue else [0, 1, 2, 3] * 2)
+
+
+@pytest.mark.no_shared_allocator
+def test_staged_record_failure_releases_readers_and_close_proceeds(
+    emulated_devices: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unrecordable completion retires only the bounce; readers and close proceed."""
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1 import staged_retrieve
+    from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer_mod
+
+    placement, _, _ = emulated_devices
+    owner = _client(_config(placement))
+    storage = _staged_storage(placement)
+    first = [_key(rank, chunk=1) for rank in range(4)]
+    second = [_key(rank, chunk=2) for rank in range(4)]
+    current = [first]
+    bounce_addresses: list[int] = []
+
+    def enqueue(cache_context, block_ids, objects, **kwargs) -> None:
+        bounce_addresses.append(objects[0].data_ptr)
+
+    module, gpu, device, finish_callback = _staged_retrieve_module(
+        storage, current, monkeypatch, enqueue
+    )
+    # The registry is process-global; isolate this test's entries.
+    monkeypatch.setattr(staged_retrieve, "_RETIRED_BUFFERS", [])
+    # Count L1Manager.finish_read calls: the client absorbs a double release
+    # as INVALID_STATE, so active_read_reservations alone cannot detect one.
+    # Also record the pool's active session count at each release: every
+    # staged release must happen inside the session that the close-time
+    # drain waits for, or it could interleave with the client close.
+    real_finish_read = l1_manager_module.L1Manager.finish_read
+    finish_reads: list[tuple[list[ObjectKey], int]] = []
+
+    def spy_finish_read(self, keys, read_locks=1):
+        finish_reads.append((list(keys), pool.report_status()["active_sessions"]))
+        return real_finish_read(self, keys, read_locks=read_locks)
+
+    monkeypatch.setattr(l1_manager_module.L1Manager, "finish_read", spy_finish_read)
+
+    def fail(message: str) -> Callable[..., None]:
+        # A fresh exception per call: a shared instance would keep the last
+        # traceback, whose frames hold mapped DAX views, alive past close.
+        def raise_error(*args: object) -> None:
+            raise RuntimeError(message)
+
+        return raise_error
+
+    device.Event.return_value.record.side_effect = fail("event")
+    gpu.stream.synchronize.side_effect = fail("stream")
+    # LMCache loggers do not propagate; attach the capture handler directly.
+    for logged in (staged_retrieve, transfer_mod, storage_manager_module):
+        monkeypatch.setattr(
+            logged.logger, "handlers", [*logged.logger.handlers, caplog.handler]
+        )
+    backend = storage.dax_coordinated_l1_backend
+    assert backend is not None
+    pool = backend.staged_retrieve
+    assert pool is not None
+    retrieve_log = ""
+    try:
+        assert owner.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        assert backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        for keys in (first, second):
+            _payload_values(
+                owner.reserve_write(keys, _layout()),
+                {key: rank + 1 for rank, key in enumerate(keys)},
+            )
+            _assert_success(owner.finish_write(keys))
+        # The first retrieve cannot record its completion (event and stream
+        # sync both fail) and retires the only slot; the second has no slot
+        # left. Both must release their LOOKUP readers.
+        for keys in (first, second):
+            current[0] = keys
+            results = backend.reserve_read(keys, 1)
+            assert all(error == L1Error.SUCCESS for error, _ in results.values())
+            del results
+            _, success = _staged_retrieve(module)
+            assert success is False
+            status = storage.report_status()["l1_manager"]
+            assert status["active_read_reservations"] == 0
+            assert status["staged_retrieve"]["quarantined_slots"] == 1
+            assert status["staged_retrieve"]["available_slots"] == 0
+            assert status["is_healthy"] is False
+            _assert_success(owner.delete(keys))
+        finish_callback.assert_not_called()
+        # Each retrieve released its readers exactly once with every key and
+        # inside an active pool session: the first through the read context,
+        # the second through the exhausted check, which takes no slot.
+        assert finish_reads == [(first, 1), (second, 1)]
+        assert pool.exhausted is True
+        assert [b.data_ptr() for b in staged_retrieve._RETIRED_BUFFERS] == [
+            bounce_addresses[0]
+        ]
+        retrieve_log = caplog.text
+    finally:
+        for record in caplog.records:
+            if record.exc_info and record.exc_info[2]:
+                traceback.clear_frames(record.exc_info[2])
+        caplog.clear()
+        gc.collect()
+        try:
+            storage.close()
+        finally:
+            owner.close()
+    assert "staged retrieve completion event failed (event)" in retrieve_log
+    assert (
+        "completion could not be recorded; retiring bounce slot 0 (1 of 1 retired)"
+        in (retrieve_log)
+    )
+    # The transition to "every slot retired" is one ERROR from the pool.
+    assert "every staged retrieve slot is retired after unproven DMA completions" in (
+        retrieve_log
+    )
+    # Only the first retrieve failed inside the read context; the second took
+    # the quiet pre-check path: one warning line, no traceback.
+    read_context_tracebacks = retrieve_log.count(
+        "Exception occurred while processing read prefetched results"
+    )
+    assert read_context_tracebacks == 1
+    assert retrieve_log.count("Cannot retrieve keys due to exception") == 1
+    unavailable = "staged retrieve unavailable: every bounce slot is retired"
+    assert unavailable in retrieve_log
+    assert "keeping 1 retired bounce buffer(s)" in caplog.text
+    staged_status = pool.report_status()
+    assert staged_status["closed"] is True
+    assert staged_status["allocated_bytes"] == 2 << 20
+    assert not backend.client.initialized
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("completes", [True, False])
+def test_staged_close_waits_for_in_flight_dma_then_client_close(
+    emulated_devices: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    completes: bool,
+) -> None:
+    """Close drains in-flight DMA up to close_timeout_s, then closes the client."""
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1 import staged_retrieve
+
+    placement, _, _ = emulated_devices
+    owner = _client(_config(placement))
+    storage = _staged_storage(placement, staged_retrieve_close_timeout_s=0.5)
+    keys = [_key(rank) for rank in range(4)]
+    module, _, device, _ = _staged_retrieve_module(
+        storage, [keys], monkeypatch, lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(staged_retrieve, "_RETIRED_BUFFERS", [])
+    monkeypatch.setattr(
+        staged_retrieve.logger,
+        "handlers",
+        [*staged_retrieve.logger.handlers, caplog.handler],
+    )
+    event = device.Event.return_value
+    backend = storage.dax_coordinated_l1_backend
+    assert backend is not None
+    pool = backend.staged_retrieve
+    assert pool is not None
+    closed = False
+    try:
+        assert owner.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        assert backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        _payload_values(
+            owner.reserve_write(keys, _layout()),
+            {key: rank + 1 for rank, key in enumerate(keys)},
+        )
+        _assert_success(owner.finish_write(keys))
+        results = backend.reserve_read(keys, 1)
+        assert all(error == L1Error.SUCCESS for error, _ in results.values())
+        del results
+        _, success = _staged_retrieve(module)
+        assert success is True
+        # The last batch's completion has not been observed: keep it pending.
+        event.query.return_value = False
+        assert storage.report_status()["l1_manager"]["active_read_reservations"] == 0
+        assert pool.report_status()["in_flight_slots"] == 1
+        with ThreadPoolExecutor(1) as executor:
+            began = time.monotonic()
+            closing_storage = executor.submit(storage.close)
+            # The drain waits for the in-flight DMA; the client is still open.
+            with pytest.raises(TimeoutError):
+                closing_storage.result(0.1)
+            assert backend.client.initialized
+            if completes:
+                event.query.return_value = True
+            closing_storage.result(5)
+            elapsed = time.monotonic() - began
+        closed = True
+        status = pool.report_status()
+        assert status["closed"] is True
+        assert status["in_flight_slots"] == 0
+        assert not backend.client.initialized
+        if completes:
+            assert status["quarantined_at_close"] == 0
+            assert status["quarantined_slots"] == 0
+            assert status["allocated_bytes"] == 0
+            assert "still in flight" not in caplog.text
+        else:
+            assert elapsed >= 0.5
+            assert status["quarantined_at_close"] == 1
+            assert status["quarantined_slots"] == 1
+            assert status["allocated_bytes"] == 2 << 20
+            assert len(staged_retrieve._RETIRED_BUFFERS) == 1
+            assert "1 bounce slot(s) still in flight after 0.5 s" in caplog.text
+        # The reader's reservations were released by the client close.
+        _assert_success(owner.delete(keys))
+    finally:
+        caplog.clear()
+        gc.collect()
+        try:
+            if not closed:
+                storage.close()
+        finally:
+            owner.close()
+
+
 def test_region_synchronize_tries_every_device_before_raising(
     emulated_devices: tuple, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2411,3 +2839,133 @@ def test_client_close_releases_reservations_when_device_sync_fails(
     finally:
         reader.close()
         owner.close()
+
+
+def test_backend_close_keeps_interrupting_error_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupted staged drain still closes the client and re-raises."""
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1 import devdax_l1_backend
+
+    # LMCache loggers do not propagate; attach the capture handler directly.
+    monkeypatch.setattr(
+        devdax_l1_backend.logger,
+        "handlers",
+        [*devdax_l1_backend.logger.handlers, caplog.handler],
+    )
+
+    def backend_with(
+        drain_error: BaseException | None, client_error: BaseException | None
+    ) -> tuple[DaxCoordinatedL1Backend, Mock]:
+        backend = DaxCoordinatedL1Backend.__new__(DaxCoordinatedL1Backend)
+        calls = Mock()
+        calls.pool.close.side_effect = drain_error
+        calls.client.close.side_effect = client_error
+        backend._staged_retrieve = calls.pool
+        backend._client = calls.client
+        return backend, calls
+
+    # A second SIGINT cuts the drain short and the client close then fails:
+    # the client close is still attempted and logged, and the interrupt wins.
+    backend, calls = backend_with(KeyboardInterrupt(), RuntimeError("client"))
+    with pytest.raises(KeyboardInterrupt):
+        backend.close()
+    calls.client.close.assert_called_once_with()
+    assert "client close failed after an interrupted staged drain" in caplog.text
+    # A drain error with a clean client close propagates the drain error.
+    backend, calls = backend_with(RuntimeError("pool"), None)
+    with pytest.raises(RuntimeError, match="pool"):
+        backend.close()
+    calls.client.close.assert_called_once_with()
+    # Normal shutdown: drain, then client close, once each.
+    backend, calls = backend_with(None, None)
+    backend.close()
+    assert calls.mock_calls == [call.pool.close(), call.client.close()]
+    # With a client lock, the client close runs under it and the drain does
+    # not, on the normal path and on the interrupted one.
+    lock = threading.Lock()
+    observed: list[tuple[str, bool]] = []
+
+    def observe(name: str) -> Callable[[], None]:
+        def side_effect() -> None:
+            # A non-blocking acquire fails only while close holds the lock.
+            acquired = lock.acquire(blocking=False)
+            if acquired:
+                lock.release()
+            observed.append((name, not acquired))
+
+        return side_effect
+
+    backend, calls = backend_with(None, None)
+    calls.pool.close.side_effect = observe("drain")
+    calls.client.close.side_effect = observe("client")
+    backend.close(client_lock=lock)
+    assert observed == [("drain", False), ("client", True)]
+    assert not lock.locked()
+    observed.clear()
+    backend, calls = backend_with(KeyboardInterrupt(), None)
+    calls.client.close.side_effect = observe("client")
+    with pytest.raises(KeyboardInterrupt):
+        backend.close(client_lock=lock)
+    assert observed == [("client", True)]
+    assert not lock.locked()
+
+
+def test_l1_manager_close_holds_lock_during_client_close() -> None:
+    """L1Manager.close drains outside its lock and closes the client under it."""
+    manager = l1_manager_module.L1Manager.__new__(l1_manager_module.L1Manager)
+    manager._lock = threading.Lock()
+    backend = DaxCoordinatedL1Backend.__new__(DaxCoordinatedL1Backend)
+    backend._staged_retrieve = Mock()
+    backend._client = Mock()
+    manager._dax_coordinated_l1 = backend
+    observed: list[tuple[str, bool]] = []
+
+    def observe(name: str) -> Callable[[], None]:
+        def side_effect() -> None:
+            # A non-blocking acquire fails only while close holds the lock:
+            # the drain must run without it (sessions release readers through
+            # the synchronized finish_read), the client close with it.
+            acquired = manager._lock.acquire(blocking=False)
+            if acquired:
+                manager._lock.release()
+            observed.append((name, not acquired))
+
+        return side_effect
+
+    backend._staged_retrieve.close.side_effect = observe("drain")
+    backend._client.close.side_effect = observe("client")
+    manager.close()
+    assert observed == [("drain", False), ("client", True)]
+    assert not manager._lock.locked()
+    # A drain cut short still closes the client under the lock and re-raises.
+    observed.clear()
+    backend._staged_retrieve.close.side_effect = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        manager.close()
+    assert observed == [("client", True)]
+    assert not manager._lock.locked()
+
+
+@pytest.mark.no_shared_allocator
+def test_missing_copy_native_fails_before_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1 import (
+        devdax_l1_backend,
+        staged_retrieve,
+    )
+
+    client = Mock()
+    monkeypatch.setattr(devdax_l1_backend, "DaxCoordinatedL1Client", client)
+    monkeypatch.delattr(staged_retrieve.native, "DevDaxCopyPool")
+    with pytest.raises(RuntimeError, match="requires native"):
+        DaxCoordinatedL1Backend(
+            _base_config(staged_retrieve=True),
+            L1MemoryManagerConfig(size_in_bytes=4096, use_lazy=False),
+            [],
+            Mock(),
+        )
+    client.assert_not_called()

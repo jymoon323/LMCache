@@ -235,3 +235,135 @@ def test_retrieve_direct_matches_kernel(name: str, allocator: LazyMemoryAllocato
             allocator.free(obj)
     finally:
         ctx.close()
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("name", ["mla_1024", "nhd_16"])
+@pytest.mark.parametrize("force_kernel", [False, True])
+def test_dax_staged_retrieve_matches_direct_bytes_and_skip(
+    name, force_kernel, monkeypatch
+):
+    """Real CPU gather + pinned bounce + GPU planner, with ordinary DRAM input.
+
+    A spin kernel queued ahead of the staged copies keeps their DMA pending
+    while the retrieve path returns: the response must not wait for the GPU.
+    Device-DAX/peer protection is covered separately; this test requires CUDA
+    and deliberately claims no DAX qualification.
+    """
+    # Standard
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # First Party
+    from lmcache.v1.distributed.dax_coordinated_l1.staged_retrieve import (
+        StagedRetrievePool,
+    )
+    from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer_mod
+    from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
+        LMCacheDrivenTransferModule,
+    )
+    import lmcache.v1.multiprocess.object_group_transfer as planner
+
+    ctx, tensors = _make_context(name)
+    num_chunks = 4
+    shape, dtype = ctx.get_kernel_group_shape_dtype(ctx.lmcache_tokens_per_chunk, 0)
+    object_bytes = shape.numel() * dtype.itemsize
+    # Small registration boundaries exercise the nonzero bounce offset.
+    monkeypatch.setattr(LazyMemoryAllocator, "PIN_CHUNK_SIZE", 1 << 20)
+    allocator = LazyMemoryAllocator(
+        init_size=16 * object_bytes, final_size=16 * object_bytes
+    )
+    pool = StagedRetrievePool(2, 2 * object_bytes, 2)
+    objects = _allocate_objects(allocator, ctx, num_chunks, True)
+    ids = [
+        list(
+            range(
+                num_chunks * ctx.calculate_num_blocks(ctx.lmcache_tokens_per_chunk, 0)
+            )
+        )
+    ]
+    initial = [tensor.clone() for tensor in tensors]
+    skip = ctx.lmcache_tokens_per_chunk + ctx.get_shape_desc(0).bs
+    finish = MagicMock()
+
+    @contextmanager
+    def read(_keys):
+        yield objects
+
+    module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
+    module._ctx = SimpleNamespace(
+        storage_manager=SimpleNamespace(
+            read_prefetched_results=read,
+            finish_read_prefetched=finish,
+        )
+    )
+    # Real completion events, captured so the test can poll them itself.
+    handles: list[torch.cuda.Event] = []
+    real_event = transfer_mod.torch_dev.Event
+
+    def make_event() -> torch.cuda.Event:
+        handle = real_event()
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(transfer_mod, "torch_dev", SimpleNamespace(Event=make_event))
+    # About half a second of GPU spin ahead of the staged H2D copies; the
+    # retrieve path returns long before it, so its completion events must
+    # still be pending then. Timing is generous: a failure here means the
+    # response waited for the DMA, not a flaky clock.
+    clock_khz = torch.cuda.get_device_properties(ctx.device).clock_rate
+    sleep_cycles = int(clock_khz * 1000 * 0.5)
+    try:
+        _run(ctx, ids, objects, H2D, "direct", ctx.max_batch_size, skip)
+        expected = [tensor.clone() for tensor in tensors]
+        for tensor, original in zip(tensors, initial, strict=True):
+            tensor.copy_(original)
+        torch.cuda.synchronize()
+        if force_kernel:
+            monkeypatch.setattr(planner, "_HAS_BATCH_MEMCPY_ASYNC", False)
+        with torch.cuda.device(ctx.device), torch.cuda.stream(ctx.stream):
+            gpu_ids = downsample_and_stage_block_ids(ctx, ids)
+            torch.cuda._sleep(sleep_cycles)
+            copied = module._retrieve_staged_group(
+                pool,
+                ctx,
+                list(range(num_chunks)),
+                gpu_ids,
+                ids,
+                0,
+                0,
+                skip,
+                "staged-gpu",
+            )
+            # Back before the DMA: the readers are released, the slots are
+            # in flight and no completion event has fired yet.
+            assert len(handles) == 2
+            assert not any(handle.query() for handle in handles)
+            status = pool.report_status()
+            assert status["active_sessions"] == 0
+            assert status["in_flight_slots"] == 2
+            assert status["slots_in_use"] == 2
+        finish.assert_called_once_with(list(range(num_chunks)))
+        ctx.stream.synchronize()
+        assert all(handle.query() for handle in handles)
+        assert copied == num_chunks * object_bytes
+        assert all(
+            _bitwise_equal(actual, want)
+            for actual, want in zip(tensors, expected, strict=True)
+        )
+        status = pool.report_status()
+        assert status["in_flight_slots"] == 0
+        assert status["slots_in_use"] == 0
+        assert status["event_timeouts"] == 0
+        # The second batch could not reuse the first batch's slot, whose DMA
+        # was still in flight, so both bounded slots were allocated.
+        assert status["allocated_bytes"] == status["capacity_bytes"]
+        assert status["capacity_bytes"] == 4 * object_bytes
+    finally:
+        ctx.stream.synchronize()
+        pool.close()
+        for obj in objects:
+            obj.ref_count_down()
+        ctx.close()
+        allocator.close()

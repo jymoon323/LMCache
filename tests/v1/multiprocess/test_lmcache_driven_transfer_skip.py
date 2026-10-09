@@ -195,7 +195,10 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
     monkeypatch.setattr(mod, "transfer_kv_per_object_group", fake_transfer)
     monkeypatch.setattr(mod, "downsample_and_stage_block_ids", lambda cc, b: b)
     monkeypatch.setattr(mod, "submit_callback_to_stream", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "torch_dev", MagicMock())
+    device = MagicMock()
+    # Recorded completions report done, so every bounce slot is reclaimed.
+    device.Event.return_value.query.return_value = True
+    monkeypatch.setattr(mod, "torch_dev", device)
     monkeypatch.setattr(mod, "Event", MagicMock())
 
     return module, read_calls, transfer_calls

@@ -1027,7 +1027,25 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         if self._dax_coordinated_l1 is not None:
-            self._dax_coordinated_l1.client.close()
+            # Drain first, outside the manager lock: staged sessions settle
+            # their shared reservations through finish_read, which takes this
+            # lock, so holding it here would deadlock the drain. Then close the
+            # client under the lock. Every reader release in this process
+            # (read contexts, finish_read_prefetched, the direct path's
+            # stream callback, failed-retrieve lock release) runs through the
+            # synchronized L1Manager methods, so a client close under the same
+            # lock cannot interleave with them. Without the lock a release
+            # could land between the native close's reservation snapshot and
+            # its finish_reads; the snapshot would then be stale, the close
+            # would skip that reservation, and its reader bit would stay in
+            # the shared region, where no owner on any host can clear it.
+            # The native close takes its snapshot and its finish_reads in
+            # separate critical sections, so this lock is the only guard for
+            # that window; it is not held during the drain only because the
+            # drain needs it. Taking the snapshot, the finish and the closed
+            # flag under one native critical section would be a separate
+            # hardening of IndexCore::close.
+            self._dax_coordinated_l1.close(client_lock=self._lock)
             return
         with self._lock:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
@@ -1048,10 +1066,18 @@ class L1Manager:
         ``total_object_count`` covers resident and staging objects;
         ``staging_object_count`` / ``staging_bytes`` report the staging
         subset and ``write_locked_count`` the live reservations among them.
+        With DAX-Coordinated L1 staged retrieval, ``is_healthy`` is false
+        while any bounce slot is retired after an unproven DMA completion.
         """
         if self._dax_coordinated_l1 is not None:
-            status = self._dax_coordinated_l1.client.report_status()
+            status: dict = self._dax_coordinated_l1.client.report_status()
             status["memory_configured_bytes"] = self._configured_capacity_bytes
+            staged_retrieve = self._dax_coordinated_l1.staged_retrieve
+            if staged_retrieve is not None:
+                staged_status = staged_retrieve.report_status()
+                status["staged_retrieve"] = staged_status
+                if staged_status["quarantined_slots"]:
+                    status["is_healthy"] = False
             return status
         read_locked = 0
         temporary = 0

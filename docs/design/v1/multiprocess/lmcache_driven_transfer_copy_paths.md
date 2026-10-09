@@ -81,6 +81,15 @@ Callers that must stay on the kernel path pass no `block_ids_host`, which is
 how the staged path is exercised in tests and how `qstore` keeps its existing
 behaviour.
 
+"Staged" above means the kernel path's block-id staging
+(`downsample_and_stage_block_ids`), not DAX-Coordinated L1 staged retrieval.
+That feature hands bounce objects (pinned DRAM, `meta.address` = offset inside
+the slot) to `transfer_kv_per_object_group` together with `block_ids_host`, so
+it follows the same selection rule as any other retrieve: direct when the
+request qualifies, kernel otherwise (`_retrieve_staged_group`'s `enqueue`
+closure; `tests/v1/multiprocess/test_staged_retrieve_slicing.py` checks that
+the staged and direct plans match).
+
 ## Cost model
 
 Measured on H200 (CUDA 13.0, driver 580): a batch entry costs ~0.6 us of

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapt the DAX-Coordinated L1 lifecycle to the public L1 manager contract."""
 
+# Standard
+from contextlib import AbstractContextManager, nullcontext
+
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
     DaxCoordinatedL1Config,
@@ -17,6 +21,7 @@ from lmcache.v1.distributed.dax_coordinated_l1.devdax_transfer_logging import (
 from lmcache.v1.distributed.dax_coordinated_l1.devdax_types import (
     DevDaxReservationResult,
 )
+from lmcache.v1.distributed.dax_coordinated_l1.staged_retrieve import StagedRetrievePool
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import (
     L1ManagerListener,
@@ -26,6 +31,7 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus
 
+logger = init_logger(__name__)
 L1OperationResult = tuple[L1Error, MemoryObj | None]
 
 
@@ -62,7 +68,29 @@ class DaxCoordinatedL1Backend:
             listeners: Live listener list owned by the generic L1 manager.
             event_bus: Process event bus used for normal L1 lifecycle events.
         """
-        self._client = DaxCoordinatedL1Client(dax_coordinated_l1_config, memory_config)
+        self._staged_retrieve = (
+            StagedRetrievePool(
+                dax_coordinated_l1_config.staged_retrieve_slots,
+                dax_coordinated_l1_config.staged_retrieve_slot_bytes,
+                dax_coordinated_l1_config.staged_retrieve_copy_threads,
+                event_timeout_s=(
+                    dax_coordinated_l1_config.staged_retrieve_event_timeout_s
+                ),
+                close_timeout_s=(
+                    dax_coordinated_l1_config.staged_retrieve_close_timeout_s
+                ),
+            )
+            if dax_coordinated_l1_config.staged_retrieve
+            else None
+        )
+        try:
+            self._client = DaxCoordinatedL1Client(
+                dax_coordinated_l1_config, memory_config
+            )
+        except BaseException:
+            if self._staged_retrieve is not None:
+                self._staged_retrieve.close()
+            raise
         self._listeners = listeners
         self._event_bus = event_bus
         self._writers: dict[ObjectKey, tuple[str, int]] = {}
@@ -73,6 +101,47 @@ class DaxCoordinatedL1Backend:
     def client(self) -> DaxCoordinatedL1Client:
         """Expose the lifecycle owner for registration, diagnostics and shutdown."""
         return self._client
+
+    @property
+    def staged_retrieve(self) -> StagedRetrievePool | None:
+        """Return the retrieve-only bounce pool, or None for direct transfers."""
+        return self._staged_retrieve
+
+    def close(self, client_lock: AbstractContextManager[object] | None = None) -> None:
+        """Drain staged sessions, then close reservations and DAX mappings.
+
+        Args:
+            client_lock: Context entered around the client close, or None for
+                no context. The L1 manager passes its lock so that no reader
+                release of this process can interleave with the native close.
+                The pool drain runs outside ``client_lock`` because draining
+                sessions need the L1 manager lock to release their readers.
+
+        The client is closed even when the staged drain is cut short, for
+        example by a second SIGINT during shutdown, so this process's shared
+        reservations are always released. A client close Exception is then
+        logged and the interrupting error is re-raised; a BaseException from
+        the client close propagates instead.
+        """
+        if client_lock is None:
+            client_lock = nullcontext()
+        try:
+            if self._staged_retrieve is not None:
+                self._staged_retrieve.close()
+        except BaseException:
+            try:
+                with client_lock:
+                    self._client.close()
+            except Exception:
+                logger.exception(
+                    "DAX-Coordinated L1 client close failed after an interrupted "
+                    "staged drain"
+                )
+            # Bare raise: the inner handler has finished, so this re-raises the
+            # interrupting error with its original traceback.
+            raise
+        with client_lock:
+            self._client.close()
 
     def reserve_read(
         self, keys: list[ObjectKey], read_locks: int

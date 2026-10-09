@@ -18,6 +18,10 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.distributed.dax_coordinated_l1.staged_retrieve import (
+    CompletionHandle,
+    StagedRetrievePool,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -48,6 +52,19 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+
+class _Completed:
+    """Completion handle for staged work already settled by a stream sync."""
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        return None
+
+
+_COMPLETED = _Completed()
 
 
 def get_layout_desc(
@@ -956,12 +973,35 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            staging = None
+            if self._ctx.storage_manager.uses_dax_coordinated_l1 is True:
+                backend = self._ctx.storage_manager.dax_coordinated_l1_backend
+                if backend is not None:
+                    staging = backend.staged_retrieve
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
                         continue
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
+                    if staging is not None:
+                        copied_bytes = self._retrieve_staged_group(
+                            staging,
+                            cache_context,
+                            in_window_keys,
+                            block_ids_per_group_gpu,
+                            gpu_block_ids,
+                            obj_group_id,
+                            skip,
+                            skip_first_n_tokens,
+                            transfer_key,
+                        )
+                        if copied_bytes is None:
+                            retrieve_succeeded = False
+                            break
+                        total_bytes += copied_bytes
+                        prefetched_keys.extend(in_window_keys)
+                        continue
                     with self._ctx.storage_manager.read_prefetched_results(
                         in_window_keys
                     ) as window_objs:
@@ -999,7 +1039,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 retrieve_succeeded = False
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                if prefetched_keys:
+                if prefetched_keys and staging is None:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_read_prefetched",
@@ -1040,6 +1080,116 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             event_backend.export_event(event, cache_context.device),
             retrieve_succeeded,
         )
+
+    def _retrieve_staged_group(
+        self,
+        staging: StagedRetrievePool,
+        cache_context: BaseCacheContext,
+        keys: list[ObjectKey],
+        block_ids_gpu: list,
+        block_ids_host: list[list[int]],
+        object_group_id: int,
+        skipped_chunks: int,
+        skip_first_n_tokens: int,
+        transfer_key: str,
+    ) -> int | None:
+        """Copy one reserved group through bounded DRAM; return after enqueue.
+
+        The pool session spans every batch's CPU gather, H2D enqueue and
+        completion record plus the shared reservation settlement, so backend
+        close cannot race a CPU copy or a finish_read_prefetched call. The
+        readers are released right after the last gather, inside the
+        session: the GPU reads only the bounce, never the DAX payload, so the
+        DMA needs no reader, and a stream callback would release outside the
+        session. The response returns after the last batch is recorded; the
+        engine waits on the retrieve's completion event, recorded after every
+        enqueued copy on the same stream, and each bounce slot returns to the
+        pool once its recorded completion is observed at a later acquisition,
+        status report or close. The session refuses entry only while closing;
+        the client close that follows releases every reservation of this
+        process. Failures propagate inside read_prefetched_results, which
+        releases the readers; a completion that cannot be recorded retires
+        the bounce slot. Once every slot is retired, the exhausted check
+        inside the session releases this request's readers and fails without
+        taking a slot, so the close-time drain still covers that release; a
+        retire that races with the check still fails inside
+        read_prefetched_results.
+        """
+        chunk_size = cache_context.lmcache_tokens_per_chunk
+        groups = cache_context.kv_layer_groups_manager
+        blocks_per_window = [
+            cache_context.calculate_num_blocks(
+                min(chunk_size, groups.get_subchunk_sw_size_tokens(g)), g
+            )
+            for g in range(groups.num_kernel_groups)
+        ]
+
+        def enqueue(start: int, bounce: list[MemoryObj]) -> None:
+            first = skipped_chunks + start
+            end = first + len(bounce)
+            transfer_kv_per_object_group(
+                cache_context,
+                [
+                    ids[first * b : end * b]
+                    for ids, b in zip(block_ids_gpu, blocks_per_window, strict=True)
+                ],
+                bounce,
+                object_group_id=object_group_id,
+                batch_size=cache_context.max_batch_size,
+                skip_first_n_tokens=max(0, skip_first_n_tokens - first * chunk_size),
+                direction=lmcache_native.TransferDirection.H2D,
+                transfer_key=transfer_key,
+                block_ids_host=[
+                    ids[first * b : end * b]
+                    for ids, b in zip(block_ids_host, blocks_per_window, strict=True)
+                ],
+            )
+
+        def record() -> CompletionHandle:
+            # Record after every enqueue attempt, including partial failures.
+            # If event creation or record fails, synchronize the stream once
+            # (a blocking wait on this thread) and report the work complete;
+            # if that fails too, the pool retires the slot.
+            try:
+                done = torch_dev.Event()
+                done.record(cache_context.stream)
+                return done
+            except Exception as error:
+                logger.warning(
+                    "staged retrieve completion event failed (%s); falling back "
+                    "to stream synchronize",
+                    error,
+                )
+                cache_context.stream.synchronize()
+                return _COMPLETED
+
+        with staging.session() as transfer:
+            if staging.exhausted:
+                # Every bounce slot is retired: fail inside the session, so the
+                # pool drain at close waits for this release, but without
+                # taking a slot. The LOOKUP readers of this request are
+                # released with the same one-lock-per-key call the success
+                # path makes. A retire that lands between this check and
+                # _acquire still fails inside read_prefetched_results, which
+                # releases the readers itself.
+                logger.warning(
+                    "staged retrieve unavailable: every bounce slot is retired; "
+                    "releasing %d reader lock(s) and failing the retrieve",
+                    len(keys),
+                )
+                self._ctx.storage_manager.finish_read_prefetched(keys)
+                return None
+            with self._ctx.storage_manager.read_prefetched_results(keys) as objects:
+                if objects is None or len(objects) != len(keys):
+                    logger.error("Some keys not found during staged retrieve!")
+                    return None
+                transfer(objects, enqueue, record)
+                copied_bytes = sum(obj.get_size() for obj in objects)
+            # Readers are released here, before the DMA completes: the GPU
+            # reads only the bounce and every object has been gathered into
+            # it. No stream callback, so the release stays inside the session.
+            self._ctx.storage_manager.finish_read_prefetched(keys)
+            return copied_bytes
 
     def _publish_token_bindings(
         self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]

@@ -922,6 +922,100 @@ auto-start disabled in vLLM:
             }
         }'
 
+DAX-Coordinated L1 staged retrieval
+-----------------------------------
+
+Within the JSON passed to ``--dax-coordinated-l1-config-json``, add these
+host-local fields to an existing qualified DAX-Coordinated L1 configuration::
+
+    "staged_retrieve": true,
+    "staged_retrieve_slots": 4,
+    "staged_retrieve_slot_bytes": 268435456,
+    "staged_retrieve_copy_threads": 4,
+    "staged_retrieve_event_timeout_s": 30.0,
+    "staged_retrieve_close_timeout_s": 30.0,
+    "skip_payload_flush": false
+
+``staged_retrieve`` defaults to ``false`` (the existing direct retrieve).
+When enabled, native libc workers copy each reserved DAX payload into a
+reusable pinned DRAM buffer before the existing H2D transfer. STORE remains
+direct GPU-to-DAX with the same READY publication. Rank placement, shared
+layout and reader reservations are unchanged. Rebuild the native extension
+after updating; a missing copy pool is an error, with no Python fallback.
+
+The four default slots hold at most 1 GiB of pinned payload per MP server
+process, allocated lazily and shared by all of its ranks and pipelines.
+Pinned buffers come from the PyTorch host allocator, which by default rounds
+each allocation up to a power of two and keeps freed blocks cached after
+close, so a ``staged_retrieve_slot_bytes`` that is not a power of two can pin
+up to about twice the configured capacity. Buffers are transient transfer
+storage, not a DRAM KV cache.
+
+Each KV object must fit in one slot; increase ``staged_retrieve_slot_bytes``
+when the model's object is larger.
+A pipeline packs as many objects as fit into one slot, copies them with the
+native workers, enqueues the H2D copy from that slot and records a completion
+event on the cache stream; it then takes another free slot for the next batch
+without waiting for the DMA, so the CPU gather of one batch overlaps the DMA
+of the batches before it, and one pipeline can have every slot in flight. A
+slot returns to the pool once its completion is observed, at a later
+acquisition, status report or close. When no slot is free the pipeline waits
+for the oldest in-flight completion; nothing reserves slots ahead, so the
+wait cannot deadlock. Different pipelines use different slots. The retrieve
+response returns once the last batch has been gathered, enqueued and
+recorded; the DMA completes on the stream behind the completion event the
+engine already waits on, so a staged retrieve does not hold one of the
+``max_gpu_workers`` threads during the DMA. Shared reader protection is
+released as soon as the last batch has been gathered into pinned memory: the
+GPU reads only the bounce, never the DAX payload. Staging requires CPU
+payload reads, so ``staged_retrieve=true`` with ``skip_payload_flush=true`` is
+rejected. Performance improvement is not guaranteed.
+
+A slot is retired in four cases: the completion event cannot be recorded and
+the stream synchronize that replaces it (logged as a warning) also fails; the
+completion query raises; a pipeline waits for the slot and its recorded
+completion is still pending ``staged_retrieve_event_timeout_s`` after it was
+recorded; or the slot is still in flight
+``staged_retrieve_close_timeout_s`` after close started (quarantine). A
+retired slot's buffer is kept for the rest of the process lifetime and never
+reused, so each retired slot leaks one pinned slot allocation
+(``staged_retrieve_slot_bytes`` rounded up to a power of two); the buffer is
+also kept in a module-level registry that outlives the pool. A record failure
+fails its retrieve, whose DAX reader reservations are released as usual, so
+owners can delete those objects. A slot retired while a pipeline waits for it
+costs only that slot, and the remaining slots keep serving. When the last slot
+is retired an ERROR is logged once; later staged retrieves release their
+reader locks inside the pool session, without taking a slot, and fail with a
+single warning line until the server is restarted.
+
+Backend close drains the active sessions, waits up to
+``staged_retrieve_close_timeout_s`` for in-flight DMA, quarantines the slots
+still in flight (one warning), logs the retired buffers it keeps and closes
+the client; if the drain is interrupted, a client close error is logged and
+the interrupting error is re-raised. The L1 manager runs the drain outside
+its lock, because sessions take that lock to release their readers, and the
+client close under it, so no reader release of this process can interleave
+with the native close. Client close releases this process's reservations
+even when the device sync fails and re-raises the error; the payload stays
+mapped and a later close unmaps once a device sync succeeds. While the device
+error persists the mapping is kept until process exit by design. With TP>1
+every visible device is synchronized before reservations are released, even
+if one device raises.
+
+The L1 status includes ``staged_retrieve`` with ``copy_backend: native``,
+``copy_mode: libc``, ``copy_threads``, ``slot_bytes``, ``slots``,
+``capacity_bytes``, ``allocated_bytes``, ``active_sessions``, slot pressure
+(``slots_in_use``, ``available_slots``, ``in_flight_slots``, ``peak_slots``,
+``slot_waits``), completion polling (``event_queries``, ``event_timeouts``,
+``event_timeout_s``, ``close_timeout_s``), ``gather_bytes``,
+``gather_seconds``, ``quarantined_slots`` (retired slots),
+``quarantined_at_close``, ``closing`` and ``closed``. While
+``quarantined_slots`` is nonzero, the L1 status reports ``is_healthy: false``.
+``/healthcheck`` does not reflect this flag; alert on ``/status``
+(``storage_manager.l1_manager.is_healthy`` or
+``staged_retrieve.quarantined_slots``). The existing L1 write-staging memory
+counter keeps its original meaning.
+
 Environment Variables
 ---------------------
 

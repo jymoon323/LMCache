@@ -278,6 +278,35 @@ class DaxCoordinatedL1Config:
     Does not change payload capacity or the shared layout digest.
     """
 
+    staged_retrieve: bool = False
+    """Retrieve through native libc copy into temporary pinned DRAM, then H2D.
+    STORE remains direct. This host-local option requires payload flush/refresh
+    and the native copy pool; there is no Python fallback.
+    """
+
+    staged_retrieve_slots: int = 4
+    """Maximum simultaneous pinned bounce buffers (allocated lazily)."""
+
+    staged_retrieve_slot_bytes: int = 256 * 1024 * 1024
+    """Bytes per bounce buffer; each KV object must fit in one buffer.
+    The payload memory bound is slots * slot_bytes before the PyTorch host
+    allocator rounds each slot up to a power of two, independent of request
+    size.
+    """
+
+    staged_retrieve_copy_threads: int = 4
+    """Native libc CPU copy workers shared by all local ranks/pipelines."""
+
+    staged_retrieve_event_timeout_s: float = 30.0
+    """Seconds a recorded bounce DMA completion may stay pending while a
+    pipeline waits for that slot; past that the slot is retired as unknown.
+    """
+
+    staged_retrieve_close_timeout_s: float = 30.0
+    """Seconds backend close waits for in-flight bounce DMA before
+    quarantining the remaining slots (their buffers are kept until exit).
+    """
+
     ownership_mode: Literal["equal", "participant_0_all"] = "equal"
     """Payload-slot ownership policy.
     ``equal`` divides slots equally. ``participant_0_all`` assigns all slots
@@ -302,9 +331,28 @@ class DaxCoordinatedL1Config:
             "skip_payload_flush",
             "memcheck_on_attach",
             "per_transfer_logging",
+            "staged_retrieve",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"DAX-Coordinated L1 {name} must be a boolean")
+        for name in (
+            "staged_retrieve_slots",
+            "staged_retrieve_slot_bytes",
+            "staged_retrieve_copy_threads",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(
+                    f"DAX-Coordinated L1 {name} must be a positive integer"
+                )
+        for name in (
+            "staged_retrieve_event_timeout_s",
+            "staged_retrieve_close_timeout_s",
+        ):
+            timeout = getattr(self, name)
+            if type(timeout) not in (int, float) or timeout <= 0:
+                raise ValueError(f"DAX-Coordinated L1 {name} must be a positive number")
+        if self.staged_retrieve and self.skip_payload_flush:
+            raise ValueError("staged_retrieve requires skip_payload_flush=false")
         if (
             type(self.read_view_cache_max_entries) is not int
             or self.read_view_cache_max_entries < 0

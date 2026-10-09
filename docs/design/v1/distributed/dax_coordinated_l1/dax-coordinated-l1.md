@@ -4,7 +4,9 @@
 same physical Device-DAX range. The shared index, slot ownership records and
 cross-host synchronization state reside. Participants coordinate
 allocation and object lifetime through this metadata without per-operation
-metadata RPCs; GPU payload transfers use direct DMA.
+metadata RPCs; GPU payload transfers use direct DMA. An opt-in
+[staged retrieval](#staged-retrieval-opt-in) mode instead copies RETRIEVE
+payloads through bounded pinned DRAM before the H2D DMA; STORE stays direct.
 
 ```text
 +--------------------+              +----------------------------+              +--------------------+
@@ -85,6 +87,12 @@ attach memcheck, timeout and logging are host-local settings.
 | `memcheck_on_attach` | `false`; opt-in full-index diagnostic scan with all participants quiesced |
 | `per_transfer_logging` | `false`; completed STORE/RETRIEVE bytes, latency and GB/s |
 | `rank_placement` | Required for TP=1..8; all device paths, metadata reservations and payload ranges live in `regions`; see [TP support](#tp-support) |
+| `staged_retrieve` | `false`; host-local opt-in to [staged retrieval](#staged-retrieval-opt-in); requires `skip_payload_flush=false` |
+| `staged_retrieve_slots` | `4`; pinned DRAM bounce slots per MP server, allocated lazily |
+| `staged_retrieve_slot_bytes` | `268435456` (256 MiB); bytes per slot; every KV object must fit in one slot (allocator rounds to a power of two) |
+| `staged_retrieve_copy_threads` | `4`; native libc copy workers per MP server |
+| `staged_retrieve_event_timeout_s` | `30.0`; seconds a recorded bounce DMA completion may stay pending while a pipeline waits for that slot before it is retired |
+| `staged_retrieve_close_timeout_s` | `30.0`; seconds backend close waits for in-flight bounce DMA before quarantining the remaining slots |
 
 - Llama or Qwen3 model names, one homogeneous object group and one runtime
   `[K/V, layers, tokens, hidden]` layout. Qwen3.5 and other model names
@@ -316,6 +324,10 @@ requires owner deletion followed by a new allocation; there is no in-place updat
 | 5 | H2D done → release reader | D2H done → publish payload → publish `READY` → unlock |
 
 Reader steps 1–3 run inside ZMQ `LOOKUP`; step 4 runs during `RETRIEVE`.
+With [staged retrieval](#staged-retrieval-opt-in), step 4 is a CPU copy from
+DAX into pinned DRAM followed by H2D from DRAM, and step 5 follows the CPU
+copy: the GPU reads only the pinned buffer, so the reader is released before
+the H2D copy completes.
 Writer steps assume the internal key lookup reported the key absent.
 
 Reader activity and the writer lock are held from step 2 through step 5.
@@ -387,6 +399,107 @@ delete_key() attempts to delete an object in two steps:
 
 Only the slot owner may delete an object. Now automatic DAX L1 eviction is unsupported; a full owner shard returns `OUT_OF_MEMORY`.
 
+## Staged retrieval (opt-in)
+
+`staged_retrieve=true` changes only how RETRIEVE moves bytes. LOOKUP
+reservations, the shared index protocol, STORE and the on-media layout are
+unchanged.
+
+```text
+direct: DAX ──────────────── H2D DMA ────────────────→ GPU
+staged: DAX ──native libc copy──→ pinned DRAM slot ──H2D DMA──→ GPU
+```
+
+**Path.** For each object group, `read_prefetched_results` returns the DAX
+views reserved by LOOKUP. `StagedRetrievePool` packs as many objects as fit
+into one slot at 64-byte aligned offsets, copies them with the native
+`DevDaxCopyPool` workers, waits for the copy, enqueues the existing
+object-group H2D transfer from the slot and records a completion event on the
+cache stream; the host does not wait for the DMA. The pipeline then takes
+another free slot for the next batch, or returns after the last one. A
+pipeline gathers into one slot at a time but can have every slot in flight, so
+the CPU gather of one batch overlaps the DMA of the batches before it; when no
+slot is free it waits for the oldest in-flight completion. Nothing reserves
+slots ahead, so the wait cannot deadlock. Other pipelines use the remaining
+slots.
+
+**Address contract.** A bounce object keeps the source's shape, dtype and
+format, but its `meta.address` is the byte offset inside its slot, never the
+DAX logical offset. The H2D planners see only bounce objects.
+
+**Lifetime.** The DAX reader reservation is held from LOOKUP through the last
+gather. The module then calls `finish_read_prefetched` directly, inside the
+pool session and before the DMA completes: the GPU reads only the bounce,
+never the DAX payload, so the DMA needs no reader, and a stream callback
+would release outside the session. The pool session wraps reservation
+settlement, so backend close drains active sessions before unmapping. The
+session refuses entry only while closing; the client close that follows
+releases every reservation of this process. Each bounce slot stays in flight
+until its completion event is observed, at a later slot acquisition, a status
+report or close; the RETRIEVE response returns after the last batch is
+recorded, and the engine waits on the retrieve's completion event, which is
+recorded after every enqueued copy on the same stream.
+
+**Failure policy.** A CPU copy or submit failure settles every submitted copy
+before raising; an H2D enqueue failure still records the completion, so a
+partially enqueued batch keeps its slot in flight until the GPU is done.
+Either way the error is raised inside `read_prefetched_results`, which
+releases the readers. A slot is retired in four cases: (1) the completion
+event cannot be recorded and the stream synchronize that replaces it (logged
+as a warning) also fails, so DMA completion is unknown while the GPU can only
+be reading the bounce slot; (2) the completion query raises; (3) a pipeline
+waits for the slot and its recorded completion is still pending
+`staged_retrieve_event_timeout_s` after it was recorded; (4) the slot is still
+in flight `staged_retrieve_close_timeout_s` after close started (quarantine).
+A retired slot's buffer stays allocated for the process lifetime in a
+module-level registry, so it outlives the pool, and is never reused. A record
+failure fails its retrieve, and the DAX reader reservations are released
+normally, so owners can delete those objects. A slot retired while a pipeline
+waits for it costs only that slot, and the remaining slots keep serving.
+
+**Exhausted pool.** When the last slot is retired the pool logs one ERROR and
+`exhausted` becomes true; later staged retrieves check it inside the pool
+session, before reading, release their reader locks with the same call the
+success path makes, log one warning and fail without taking a slot, until
+restart; the session keeps that release inside the drain that backend close
+waits for. A retire racing with that check still fails inside
+`read_prefetched_results`.
+
+**Close.** Backend close drains sessions, waits up to
+`staged_retrieve_close_timeout_s` for in-flight DMA, quarantines the slots
+still in flight (retired, buffers kept, one warning), keeps retired buffers
+with a warning and always closes the client; if the drain is interrupted, a
+client close error is logged and the interrupting error is re-raised. The L1
+manager drains the pool outside its lock (sessions need it to release their
+readers) and closes the client under it, so no reader release of this process
+can interleave with the native close's reservation snapshot. Client close
+releases this process's reservations even when the device sync fails, then
+re-raises; with TP > 1 every visible device is synchronized first, even if one
+raises. The payload stays mapped and a later close unmaps once a device sync
+succeeds; while the device error persists the mapping is kept until process
+exit by design.
+
+**Status and alerting.** L1 status reports `is_healthy: false` while
+`quarantined_slots` (retired slots) is nonzero and lists `available_slots`,
+`in_flight_slots`, `event_queries`, `event_timeouts` and
+`quarantined_at_close`; `/healthcheck` does not reflect `is_healthy`, so alert
+on `/status`.
+
+**Constraints.** Overlap is bounded by slot availability: one pipeline can
+fill every slot with in-flight DMA, and the next pipeline then waits for the
+oldest completion. Copy workers are not pinned to CPUs or NUMA nodes (the
+native pool accepts a CPU list; the staged pool passes none). The backend
+admits one homogeneous object group, so production staging sees one group;
+multi-group slicing is covered by the planner test. Staging reads payloads
+with the CPU, so `skip_payload_flush=true` is rejected. Pinned buffers come
+from the PyTorch host allocator, which by default rounds requests up to a
+power of two and caches freed blocks.
+
+Tests: `tests/v1/distributed/test_staged_retrieve.py` (pool contracts),
+`tests/v1/multiprocess/test_staged_retrieve_slicing.py` (staged and direct
+H2D plans match) and the staged cases in
+`tests/v1/distributed/test_dax_coordinated_l1.py` (real native index).
+
 ## Status, limits and validation
 
 Status and usage are reported per participant, based on its owned slots and
@@ -416,6 +529,10 @@ runtime allocation is limited to the usable capacity of complete slots.
   cannot be combined with this backend. Runtime L2 attachment is also rejected.
 - Automatic eviction, force deletion and global `clear()` are unsupported.
   Reclaiming committed objects requires explicit deletion by the owner participant.
+- A staged retrieve slot retired after an unproven DMA completion (record
+  failure, query error, event timeout or close-time quarantine) leaks its
+  pinned buffer (rounded up to a power of two by the host allocator) until
+  restart; when every slot is retired, staged retrieves fail until restart.
 
 ### Follow-up TODOs
 
@@ -427,6 +544,16 @@ STORE/DELETE events to track objects and ACCESS events to track recency across
 MPs when selecting eviction candidates. The current coordinator eviction
 controller handles L2 only; shared DAX L1 eviction remains a separate extension.
 This PR defers those reporting changes to minimize common-code modifications: it retains per-MP owner capacity declarations and L1 object events with `shared=False`. A follow-up PR would be updating the common capacity and event reporting paths together, with capacity and visibility.
+
+Staged retrieval follow-ups, recorded without code changes: a waiting pipeline polls only the
+oldest in-flight slot, not every in-flight completion. `IndexCore::close` snapshots the local
+read reservations and finishes them in separate `local_mutex_` critical sections and sets `closed_`
+only at the end, so a reservation released or created in between is not covered by the native
+close; the Python L1 manager lock around the client close is the only guard today, and taking the
+snapshot, the finish and the closed flag under one critical section is a native hardening item.
+Copy workers are not pinned to CPUs or NUMA nodes. `/healthcheck` reports healthy whenever the
+engine exists and does not reflect `is_healthy`. Direct and staged retrieval have not been compared
+for performance, and no end-to-end smoke on real DAX devices with vLLM has been run on this branch.
 
 Repository tests cover opt-in builds, configuration/model geometry, native
 layout/lifecycle/contention, TP routing and mocked device-range/CUDA-registration
