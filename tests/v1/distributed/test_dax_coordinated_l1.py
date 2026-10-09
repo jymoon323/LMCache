@@ -2316,3 +2316,98 @@ def test_zero_read_view_cache_limit_preserves_reads_without_retaining_views(
         assert reader.report_status()["active_read_reservations"] == 0
         del first, second
         _assert_success(owner.delete([key]))
+
+
+def test_region_synchronize_tries_every_device_before_raising(
+    emulated_devices: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Portable sync visits every device and re-raises the first error."""
+    placement, _, _ = emulated_devices
+    assert placement.tp_size > 1  # portable registration: per-device sync loop
+    config = _config(placement, 1)
+    region = DaxCoordinatedL1Region(
+        config,
+        L1MemoryManagerConfig(
+            size_in_bytes=4096,
+            use_lazy=False,
+            shm_name="",
+            devdax_path=config.devdax_path,
+        ),
+    )
+    calls: list[int] = []
+
+    def recorder(failing: int, kind: type[BaseException]) -> Callable[[int], None]:
+        def synchronize(device: int) -> None:
+            calls.append(device)
+            if device == failing:
+                raise kind(f"device {device}")
+
+        return synchronize
+
+    try:
+        assert region.cuda_registered  # emulated registration: DMA to drain
+        for failing, kind in ((0, RuntimeError), (1, KeyboardInterrupt)):
+            calls.clear()
+            # Scoped patch: the fixture keeps the device unavailable, so the
+            # close below skips the sync instead of reaching a real device.
+            with monkeypatch.context() as patch:
+                patch.setattr(devdax_region.torch_dev, "is_available", lambda: True)
+                patch.setattr(devdax_region.torch_dev, "device_count", lambda: 3)
+                patch.setattr(
+                    devdax_region.torch_dev, "synchronize", recorder(failing, kind)
+                )
+                with pytest.raises(kind, match=f"device {failing}"):
+                    region.synchronize()
+            # The devices after the failing one were still synchronized.
+            assert calls == [0, 1, 2]
+    finally:
+        region.close()
+
+
+def test_client_close_releases_reservations_when_device_sync_fails(
+    emulated_devices: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed close-time device sync must not strand reader bits."""
+    placement, _, unpinned = emulated_devices
+    owner = _client(_config(placement))
+    reader = _client(_config(placement, 1))
+    keys = [_key(rank) for rank in range(4)]
+
+    def fail_sync(_region: DaxCoordinatedL1Region) -> None:
+        raise RuntimeError("device sync failed")
+
+    try:
+        assert owner.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        assert reader.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        _payload_values(
+            owner.reserve_write(keys, _layout()),
+            {key: rank + 1 for rank, key in enumerate(keys)},
+        )
+        _assert_success(owner.finish_write(keys))
+        _assert_success(reader.reserve_read(keys, 1))
+        assert all(result != Raw.SUCCESS for result in owner.delete(keys).values())
+        mapped = len(unpinned)
+        # Scoped patch: undoing the fixture's device emulation would unpin
+        # through the real device spec.
+        with monkeypatch.context() as patch:
+            patch.setattr(DaxCoordinatedL1Region, "synchronize", fail_sync)
+            with pytest.raises(RuntimeError, match="device sync failed"):
+                reader.close()
+            # The reader bits are gone and the half-closed client cannot
+            # re-attach.
+            assert reader.report_status()["is_healthy"] is False
+            with pytest.raises(RuntimeError, match="closed"):
+                reader.reserve_read(keys, 1)
+            _assert_success(owner.delete(keys))
+            assert len(unpinned) == mapped  # payload stays mapped after the failure
+            # A persistent device error is sticky: every later close re-raises
+            # and keeps the payload mapped and registered, by design.
+            with pytest.raises(RuntimeError, match="device sync failed"):
+                reader.close()
+            assert len(unpinned) == mapped
+            assert reader.report_status()["cuda_registered"] is True
+        reader.close()  # the device sync works again: unregister and unmap
+        assert len(unpinned) > mapped
+    finally:
+        reader.close()
+        owner.close()

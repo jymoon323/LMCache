@@ -520,19 +520,34 @@ class DaxCoordinatedL1Client:
         return core.memcheck()
 
     def close(self) -> None:
-        """Drain DMA and release the sole native index and all payload mappings."""
+        """Drain DMA and release the sole native index and all payload mappings.
+
+        Reservations are released and new operations refused even if the
+        device sync raises; the error is then re-raised with the payload still
+        mapped. A later close unmaps once a device sync succeeds. While the
+        device error persists every close re-raises and the mapping and its
+        CUDA registration are kept until process exit by design: unmapping
+        under unknown DMA would be worse than the leak.
+        """
         with self._lifecycle_lock:
             if self._region is not None:
-                self._region.synchronize()
-                # The client owns the index; release reservations before unmapping.
-                if self._core is not None:
-                    self._core.close()
-                self._write_contexts.clear()
-                self._read_contexts.clear()
-                self._read_views.clear()
+                try:
+                    self._region.synchronize()
+                finally:
+                    # Metadata-only. Runs even when the device sync raises, so a
+                    # dead CUDA context cannot leave this process's reader/writer
+                    # bits in the shared region, and the native destructor finds
+                    # the core already closed once the mapping is gone. Marking
+                    # closed first stops a later request from re-attaching.
+                    self._closed = True
+                    if self._core is not None:
+                        self._core.close()
+                        self._core = None
+                    self._write_contexts.clear()
+                    self._read_contexts.clear()
+                    self._read_views.clear()
                 self._region.close()
                 self._region = None
-                self._core = None
             self._closed = True
 
     def _attach_geometry(self, geometry: DevDaxPayloadGeometry) -> bool:

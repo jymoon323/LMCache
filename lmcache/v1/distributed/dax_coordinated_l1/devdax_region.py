@@ -391,13 +391,43 @@ class DaxCoordinatedL1Region:
         return self._tensor(0).data_ptr(), self._payload_size, self._alignment
 
     def synchronize(self) -> None:
-        """Wait for DMA before releasing any shared reservations or registrations."""
-        if self._pinned_ranges and torch_dev.is_available():
-            if self._portable:
-                for device in range(torch_dev.device_count()):
-                    torch_dev.synchronize(device)
-            else:
-                torch_dev.synchronize()
+        """Wait for DMA on every device before releasing shared reservations.
+
+        Every visible device is synchronized even when one of them raises; the
+        first error is re-raised after the others were tried. ``BaseException``
+        is caught for that reason: a ``KeyboardInterrupt`` landing between two
+        devices still lets the remaining devices drain before it propagates
+        unchanged.
+        """
+        if not (self._pinned_ranges and torch_dev.is_available()):
+            return
+        if not self._portable:
+            # Non-portable registration (tp_size == 1) is designed for a
+            # single-device server: the current device is the DMA source.
+            torch_dev.synchronize()
+            return
+        # Do not stop at the first failing device. DaxCoordinatedL1Client.close()
+        # releases this process's shared reader and writer reservations in a
+        # finally block even when this sync raises: a dead CUDA context must not
+        # leave reader bits in the shared region, because peer owners could
+        # never delete those objects and the native index destructor would
+        # later write to unmapped metadata. A CUDA sticky error is confined to
+        # one device's primary context, so a loop that returned at the first
+        # failure would release those reservations while direct H2D DMA on the
+        # remaining, healthy devices may still read the shared payload; a peer
+        # owner could then reuse the slot under that DMA. Synchronizing every
+        # device first narrows the unknown-DMA set to the devices that actually
+        # failed. The first error is re-raised unchanged so that close still
+        # reports the failure to its caller.
+        first: BaseException | None = None
+        for device in range(torch_dev.device_count()):
+            try:
+                torch_dev.synchronize(device)
+            except BaseException as error:  # re-raised below after every device
+                if first is None:
+                    first = error
+        if first is not None:
+            raise first
 
     def close(self) -> None:
         """Drain DMA, unregister payloads, and unmap."""
