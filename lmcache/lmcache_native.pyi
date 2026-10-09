@@ -479,3 +479,115 @@ class RangePatternMatcher:
             [(0, 5), (8, 14)]
         """
         ...
+
+class DevDaxCopyStores(IntEnum):
+    """Store instructions a :class:`DevDaxCopyPool` submission uses."""
+
+    LIBC = 0
+    """libc ``memmove``."""
+    NON_TEMPORAL = 1
+    """``devdax_memcpy_nt``: AVX2 streaming stores for large segments, libc
+    otherwise."""
+
+class DevDaxCopyBatch:
+    """Completion handle of one :meth:`DevDaxCopyPool.submit`.
+
+    Settles once every copy of that submission has run. The pool's workers
+    never take the GIL, so waiting here (the GIL is released) neither stalls
+    the copies nor is stalled by other Python threads.
+    """
+
+    @property
+    def count(self) -> int:
+        """Number of copies in the submission."""
+        ...
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes covered by the submission."""
+        ...
+
+    def done(self) -> bool:
+        """Whether every copy has finished (successfully or not)."""
+        ...
+
+    def wait(self) -> None:
+        """Block until every copy has finished.
+
+        Raises:
+            RuntimeError: The first copy error, if any.
+        """
+        ...
+
+class DevDaxCopyPool:
+    """Fixed set of native copy threads shared by one process's staged retrieves.
+
+    Copies run outside the Python interpreter, so the staging fan-out
+    neither waits for nor contends with the GIL.
+    """
+
+    def __init__(self, num_threads: int, cpus: list[int] = ...) -> None:
+        """Start ``num_threads`` workers.
+
+        Args:
+            num_threads: Worker threads (``>= 1``).
+            cpus: Empty, or one CPU per worker to pin it to (best effort and
+                Linux-only; see :attr:`pinned_threads`).
+
+        Raises:
+            ValueError: If ``num_threads`` is 0 or ``cpus`` has the wrong
+                length.
+            RuntimeError: If a worker thread cannot be created.
+        """
+        ...
+
+    @property
+    def num_threads(self) -> int: ...
+    @property
+    def pinned_threads(self) -> int:
+        """Workers whose CPU pinning succeeded."""
+        ...
+
+    @property
+    def busy_seconds(self) -> float:
+        """Cumulative seconds the workers spent copying."""
+        ...
+
+    @property
+    def completed_copies(self) -> int: ...
+    @property
+    def queued(self) -> int:
+        """Copies queued but not yet picked up by a worker."""
+        ...
+
+    def submit(
+        self,
+        copies: list[tuple[int, int, int]],
+        stores: DevDaxCopyStores = ...,
+    ) -> DevDaxCopyBatch:
+        """Queue ``(dst, src, nbytes)`` raw-address copies in order.
+
+        The submission is atomic: either every copy is queued or none is.
+
+        Args:
+            copies: Destination address, source address, and byte count of
+                each copy.
+            stores: Store instructions to use (default ``LIBC``).
+
+        Returns:
+            The completion handle of the submission.
+
+        Raises:
+            RuntimeError: If :meth:`shutdown` has started.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Stop accepting submissions, finish every queued copy, and join the
+        workers. Safe to call concurrently and repeatedly."""
+        ...
+
+DEVDAX_MEMCPY_NT_MIN_BYTES: int
+
+def devdax_memcpy_nt(dst: int, src: int, nbytes: int) -> None: ...
+def devdax_memcpy_nt_backend() -> str: ...

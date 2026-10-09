@@ -4,6 +4,8 @@
 #include <pybind11/stl.h>
 #include "ttl_lock.h"
 #include "bitmap.h"
+#include "copy_pool.h"
+#include "nt_memcpy.h"
 #include "fold.h"
 #include "periodic_event_notifier.h"
 #include "utils.h"
@@ -12,6 +14,11 @@
 #include "kv_transfer_types.h"
 
 namespace py = pybind11;
+
+using lmcache::lmcache_native::DevDaxCopyBatch;
+using lmcache::lmcache_native::DevDaxCopyPool;
+using lmcache::lmcache_native::DevDaxCopyRequest;
+using lmcache::lmcache_native::DevDaxCopyStores;
 
 using lmcache::lmcache_native::Bitmap;
 using lmcache::lmcache_native::PeriodicEventNotifier;
@@ -121,6 +128,91 @@ PYBIND11_MODULE(lmcache_native, m) {
         py::arg("hit_length"), py::arg("num_chunks"), py::arg("windows"),
         "Expand a model-wide hit length into one retain bitmap of size "
         "num_chunks per window, parallel to windows.");
+
+  m.def("devdax_memcpy_nt", &lmcache::lmcache_native::devdax_memcpy_nt,
+        py::arg("dst"), py::arg("src"), py::arg("nbytes"),
+        py::call_guard<py::gil_scoped_release>(),
+        "Copy a Device-DAX gather segment to DRAM with AVX2 non-temporal "
+        "stores, falling back to libc when AVX2 is unavailable or unsuitable.");
+  m.def("devdax_memcpy_nt_backend",
+        &lmcache::lmcache_native::devdax_memcpy_nt_backend,
+        "Return avx2_nt when large gathers use AVX2 NT stores, else libc.");
+  m.attr("DEVDAX_MEMCPY_NT_MIN_BYTES") =
+      py::int_(lmcache::lmcache_native::kDevDaxMemcpyNtMinBytes);
+
+  py::enum_<DevDaxCopyStores>(
+      m, "DevDaxCopyStores",
+      "Store instructions a DevDaxCopyPool submission uses: LIBC (memmove) "
+      "or NON_TEMPORAL (devdax_memcpy_nt: AVX2 streaming stores for large "
+      "segments, libc otherwise).")
+      .value("LIBC", DevDaxCopyStores::kLibc)
+      .value("NON_TEMPORAL", DevDaxCopyStores::kNonTemporal);
+
+  py::class_<DevDaxCopyBatch, std::shared_ptr<DevDaxCopyBatch>>(
+      m, "DevDaxCopyBatch",
+      "Completion handle of one DevDaxCopyPool.submit(); settles once every "
+      "copy of that submission has run.")
+      .def("done", &DevDaxCopyBatch::done,
+           "Whether every copy has finished (successfully or not).")
+      .def(
+          "wait",
+          [](DevDaxCopyBatch& self) {
+            // A settled batch (the common case for every handle but the
+            // first one waited per batch) returns without a GIL round trip.
+            if (!self.done()) {
+              py::gil_scoped_release release;
+              self.wait();
+              return;
+            }
+            self.wait();
+          },
+          "Block until every copy has finished; re-raise the first copy "
+          "error as RuntimeError.")
+      .def_property_readonly("count", &DevDaxCopyBatch::count,
+                             "Number of copies in the submission.")
+      .def_property_readonly("nbytes", &DevDaxCopyBatch::nbytes,
+                             "Bytes covered by the submission.");
+
+  py::class_<DevDaxCopyPool>(
+      m, "DevDaxCopyPool",
+      "Fixed set of native copy threads shared by one process's staged "
+      "retrieves. Copies run outside the Python interpreter, so the staging "
+      "fan-out neither waits for nor contends with the GIL.")
+      .def(py::init<std::size_t, std::vector<int>>(), py::arg("num_threads"),
+           py::arg("cpus") = std::vector<int>{},
+           "Start num_threads workers; when cpus is given (one per worker) "
+           "each worker is pinned to its CPU, best effort.")
+      .def(
+          "submit",
+          [](DevDaxCopyPool& self,
+             const std::vector<std::tuple<std::uintptr_t, std::uintptr_t,
+                                          std::size_t>>& copies,
+             DevDaxCopyStores stores) {
+            std::vector<DevDaxCopyRequest> requests;
+            requests.reserve(copies.size());
+            for (const auto& [dst, src, nbytes] : copies) {
+              requests.push_back(DevDaxCopyRequest{dst, src, nbytes});
+            }
+            return self.submit(requests, stores);
+          },
+          py::arg("copies"), py::arg("stores") = DevDaxCopyStores::kLibc,
+          "Queue (dst, src, nbytes) copies in order and return their "
+          "DevDaxCopyBatch; the submission is atomic (all or none queued). "
+          "stores selects libc memmove or the non-temporal devdax_memcpy_nt "
+          "path. Raises RuntimeError once shutdown() has started.")
+      .def("shutdown", &DevDaxCopyPool::shutdown,
+           py::call_guard<py::gil_scoped_release>(),
+           "Stop accepting submissions, finish every queued copy, and join "
+           "the workers (safe to call concurrently and repeatedly).")
+      .def_property_readonly("num_threads", &DevDaxCopyPool::num_threads)
+      .def_property_readonly("pinned_threads", &DevDaxCopyPool::pinned_threads,
+                             "Workers whose CPU pinning succeeded.")
+      .def_property_readonly("busy_seconds", &DevDaxCopyPool::busy_seconds,
+                             "Cumulative seconds the workers spent copying.")
+      .def_property_readonly("completed_copies",
+                             &DevDaxCopyPool::completed_copies)
+      .def_property_readonly("queued", &DevDaxCopyPool::queued,
+                             "Copies queued but not yet picked up.");
 
   py::class_<TTLLock>(m, "TTLLock")
       .def(py::init<uint32_t>(), py::arg("ttl_second") = 300,

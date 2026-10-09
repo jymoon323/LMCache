@@ -34,6 +34,8 @@ COMMON_EXTENSIONS: list[CommonExtSpec] = [
         name="lmcache_native",
         sources=[
             "csrc/lmcache_native/bitmap.cpp",
+            "csrc/lmcache_native/copy_pool.cpp",
+            "csrc/lmcache_native/nt_memcpy.cpp",
             "csrc/lmcache_native/fold.cpp",
             "csrc/lmcache_native/periodic_event_notifier.cpp",
             "csrc/lmcache_native/pybind.cpp",
