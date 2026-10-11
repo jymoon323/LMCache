@@ -974,9 +974,9 @@ rejected. Performance improvement is not guaranteed.
 
 A slot is retired in four cases: the completion event cannot be recorded and
 the stream synchronize that replaces it (logged as a warning) also fails; the
-completion query raises; a pipeline waits for the slot and its recorded
-completion is still pending ``staged_retrieve_event_timeout_s`` after it was
-recorded; or the slot is still in flight
+completion query raises; a pipeline waiting for the slot polls its recorded
+completion for ``staged_retrieve_event_timeout_s``, counted from the start of
+that wait, without observing it; or the slot is still in flight
 ``staged_retrieve_close_timeout_s`` after close started (quarantine). A
 retired slot's buffer is kept for the rest of the process lifetime and never
 reused, so each retired slot leaks one pinned slot allocation
@@ -984,10 +984,15 @@ reused, so each retired slot leaks one pinned slot allocation
 also kept in a module-level registry that outlives the pool. A record failure
 fails its retrieve, whose DAX reader reservations are released as usual, so
 owners can delete those objects. A slot retired while a pipeline waits for it
-costs only that slot, and the remaining slots keep serving. When the last slot
-is retired an ERROR is logged once; later staged retrieves release their
-reader locks inside the pool session, without taking a slot, and fail with a
-single warning line until the server is restarted.
+costs only that slot: the pipeline continues on the next oldest slot with a
+fresh window, so a stream that stays stalled loses one slot per window, and
+an acquisition on a stream that never completes can take
+``staged_retrieve_slots`` times the timeout before every slot is retired.
+``staged_retrieve_event_timeout_s`` must be at least 1 second. The remaining
+slots keep serving. When the last slot is retired an ERROR is logged once;
+later staged retrieves release their reader locks inside the pool session,
+without taking a slot, and fail with a single warning line until the server
+is restarted.
 
 Backend close drains the active sessions, waits up to
 ``staged_retrieve_close_timeout_s`` for in-flight DMA, quarantines the slots

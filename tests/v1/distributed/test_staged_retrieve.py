@@ -353,6 +353,96 @@ def test_event_timeout_retires_in_flight_slot(
     assert status["allocated_bytes"] == 128  # only the retired buffer
 
 
+def test_event_timeout_counts_from_wait_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _capture(monkeypatch, caplog)
+    monkeypatch.setattr(mod, "_RETIRED_BUFFERS", [])
+    pool = StagedRetrievePool(1, 128, 1, event_timeout_s=0.2)
+    with pool.session() as transfer:
+        transfer([_object(128)], lambda *_: None, lambda: _Handle(False))
+    # The DMA stays pending longer than the timeout while nobody waits on it.
+    time.sleep(0.3)
+    began = time.monotonic()
+    with pool.session() as transfer:
+        with pytest.raises(StagedRetrieveRetiredError, match="every staged"):
+            transfer([_object(128)], lambda *_: None, _done)
+    elapsed = time.monotonic() - began
+    # The waiting acquisition still polls for one full window first.
+    assert elapsed >= 0.19, elapsed
+    status = pool.report_status()
+    assert status["event_timeouts"] == 1
+    assert status["quarantined_slots"] == 1
+    assert "did not complete within 0.2 s" in caplog.text
+    pool.close()
+
+
+def test_transient_stall_retires_at_most_one_slot(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _capture(monkeypatch, caplog)
+    monkeypatch.setattr(mod, "_RETIRED_BUFFERS", [])
+    pool = StagedRetrievePool(3, 128, 1, event_timeout_s=0.5)
+    stall = threading.Event()
+    with pool.session() as transfer:
+        # Three batches recorded milliseconds apart on one stalled stream.
+        transfer([_object(128)] * 3, lambda *_: None, lambda: _Handle(stall))
+    assert pool.report_status()["in_flight_slots"] == 3
+    threading.Timer(0.75, stall.set).start()
+    began = time.monotonic()
+    with pool.session() as transfer:
+        transfer([_object(128)], lambda *_: None, _done)
+    elapsed = time.monotonic() - began
+    # One full window retires the oldest slot; the next slot gets a fresh
+    # window, within which the stall clears and the remaining slots return.
+    assert 0.5 <= elapsed < 1.0, elapsed
+    status = pool.report_status()
+    assert status["event_timeouts"] == 1
+    assert status["quarantined_slots"] == 1
+    assert status["slot_waits"] == 1
+    assert status["in_flight_slots"] == 0
+    assert pool.exhausted is False
+    assert len(mod._RETIRED_BUFFERS) == 1
+    assert "(1 of 3 retired)" in caplog.text
+    assert not _exhausted_errors(caplog)
+    pool.close()
+
+
+def test_waiter_moves_on_when_another_waiter_retires_the_slot(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _capture(monkeypatch, caplog)
+    monkeypatch.setattr(mod, "_RETIRED_BUFFERS", [])
+    pool = StagedRetrievePool(2, 128, 1, event_timeout_s=0.3)
+    second_dma = threading.Event()
+    handles = iter([_Handle(False), _Handle(second_dma)])
+    with pool.session() as transfer:
+        transfer([_object(128), _object(128)], lambda *_: None, lambda: next(handles))
+    assert pool.report_status()["in_flight_slots"] == 2
+    began = time.monotonic()
+    finished: dict[str, float] = {}
+
+    def waiter(name: str, delay: float) -> None:
+        time.sleep(delay)
+        with pool.session() as transfer:
+            transfer([_object(128)], lambda *_: None, _done)
+        finished[name] = time.monotonic() - began
+
+    threading.Timer(0.32, second_dma.set).start()
+    with ThreadPoolExecutor(2) as executor:
+        first = executor.submit(waiter, "first", 0.0)
+        second = executor.submit(waiter, "second", 0.25)
+        first.result(5)
+        second.result(5)
+    status = pool.report_status()
+    assert status["quarantined_slots"] == 1
+    assert status["event_timeouts"] == 1
+    # The hung slot is retired at ~0.30 s by the first waiter; the second
+    # must leave that dead handle at once, not poll it for its own window.
+    assert finished["second"] < 0.45, finished
+    pool.close()
+
+
 @pytest.mark.parametrize("where", ["reclaim", "wait"])
 def test_query_exception_retires_slot(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, where: str

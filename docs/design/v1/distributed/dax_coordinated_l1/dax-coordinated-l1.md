@@ -91,7 +91,7 @@ attach memcheck, timeout and logging are host-local settings.
 | `staged_retrieve_slots` | `4`; pinned DRAM bounce slots per MP server, allocated lazily |
 | `staged_retrieve_slot_bytes` | `268435456` (256 MiB); bytes per slot; every KV object must fit in one slot (allocator rounds to a power of two); validated at model registration |
 | `staged_retrieve_copy_threads` | `4`; native libc copy workers per MP server |
-| `staged_retrieve_event_timeout_s` | `30.0`; seconds a recorded bounce DMA completion may stay pending while a pipeline waits for that slot before it is retired |
+| `staged_retrieve_event_timeout_s` | `30.0`, minimum `1.0`; seconds a waiting pipeline polls one slot's recorded DMA completion, counted from the start of that wait, before the slot is retired |
 | `staged_retrieve_close_timeout_s` | `30.0`; seconds backend close waits for in-flight bounce DMA before quarantining the remaining slots |
 
 - Llama or Qwen3 model names, one homogeneous object group and one runtime
@@ -448,14 +448,17 @@ releases the readers. A slot is retired in four cases: (1) the completion
 event cannot be recorded and the stream synchronize that replaces it (logged
 as a warning) also fails, so DMA completion is unknown while the GPU can only
 be reading the bounce slot; (2) the completion query raises; (3) a pipeline
-waits for the slot and its recorded completion is still pending
-`staged_retrieve_event_timeout_s` after it was recorded; (4) the slot is still
-in flight `staged_retrieve_close_timeout_s` after close started (quarantine).
-A retired slot's buffer stays allocated for the process lifetime in a
-module-level registry, so it outlives the pool, and is never reused. A record
-failure fails its retrieve, and the DAX reader reservations are released
-normally, so owners can delete those objects. A slot retired while a pipeline
-waits for it costs only that slot, and the remaining slots keep serving.
+waiting for the slot polls its recorded completion for
+`staged_retrieve_event_timeout_s`, counted from the start of that wait,
+without observing it; (4) the slot is still in flight
+`staged_retrieve_close_timeout_s` after close started (quarantine). A retired
+slot's buffer stays allocated for the process lifetime in a module-level
+registry, so it outlives the pool, and is never reused. A record failure fails
+its retrieve, and the DAX reader reservations are released normally, so owners
+can delete those objects. A slot retired while a pipeline waits for it costs
+only that slot: the pipeline continues on the next oldest slot with a fresh
+window, so a stream that stays stalled loses one slot per window rather than
+every in-flight slot at once. The remaining slots keep serving.
 
 **Exhausted pool.** When the last slot is retired the pool logs one ERROR and
 `exhausted` becomes true; later staged retrieves check it inside the pool
@@ -545,8 +548,12 @@ MPs when selecting eviction candidates. The current coordinator eviction
 controller handles L2 only; shared DAX L1 eviction remains a separate extension.
 This PR defers those reporting changes to minimize common-code modifications: it retains per-MP owner capacity declarations and L1 object events with `shared=False`. A follow-up PR would be updating the common capacity and event reporting paths together, with capacity and visibility.
 
-Staged retrieval follow-ups, recorded without code changes: a waiting pipeline polls only the
-oldest in-flight slot, not every in-flight completion. `IndexCore::close` snapshots the local
+Staged retrieval has three follow-ups: polling every in-flight completion while a pipeline waits
+(it now polls only the oldest slot); returning a slot retired by the event timeout to service once
+its completion is observed (retire is absorbing today); and a per-engine cap on in-flight slots,
+so that one stalled stream cannot occupy the whole process-global pool.
+
+Further staged follow-ups, recorded without code changes: `IndexCore::close` snapshots the local
 read reservations and finishes them in separate `local_mutex_` critical sections and sets `closed_`
 only at the end, so a reservation released or created in between is not covered by the native
 close; the Python L1 manager lock around the client close is the only guard today, and taking the

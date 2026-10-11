@@ -14,12 +14,12 @@ the GPU reads only the bounce, so the DAX payload is not needed once the
 gather is done.
 
 A slot is retired in four cases: its completion cannot be recorded, its query
-raises, its completion is still pending past the event timeout while a
-pipeline waits for the slot, or it is still in flight when the close-time
-drain window ends (quarantine). A retired slot's buffer is kept for the
-process lifetime in a module-level registry and never reused; a record
-failure fails its retrieve, whose shared read reservation is released as for
-any other read failure.
+raises, a waiting pipeline does not observe its completion within the event
+timeout counted from the start of that wait, or it is still in flight when
+the close-time drain window ends (quarantine). A retired slot's buffer is
+kept for the process lifetime in a module-level registry and never reused; a
+record failure fails its retrieve, whose shared read reservation is released
+as for any other read failure.
 """
 
 # Standard
@@ -73,7 +73,6 @@ class _InFlight:
 
     handle: CompletionHandle
     recorded_at: float
-    deadline: float
 
 
 class StagedRetrieveRetiredError(RuntimeError):
@@ -90,15 +89,18 @@ class StagedRetrievePool:
         slots: Maximum concurrent bounce allocations.
         slot_bytes: Bytes per allocation; a single object must fit in a slot.
         copy_threads: Number of native libc copy workers (no Python fallback).
-        event_timeout_s: How long a recorded completion may stay pending once
-            an acquisition waits on it; past that the slot is retired as
-            unknown instead of blocking the pipeline forever.
+        event_timeout_s: How long one acquisition polls the oldest in-flight
+            slot, counted from the start of that wait, before retiring it as
+            unknown instead of blocking the pipeline forever; every waited
+            slot gets a full window. DaxCoordinatedL1Config enforces a 1 s
+            floor; the pool itself accepts any positive number.
         close_timeout_s: How long close waits for in-flight DMA before
             quarantining the remaining slots.
 
     Raises:
         ValueError: If a limit is not a positive integer or a timeout is not
-            a positive number.
+            a positive number (the configuration layer additionally enforces
+            a 1 s floor on the event timeout).
         RuntimeError: If the native copy extension is unavailable.
 
     Pinned payload capacity is bounded by ``slots * slot_bytes`` before the
@@ -106,10 +108,10 @@ class StagedRetrievePool:
     allocation is one pinned region; descriptor addresses are offsets within
     it, never DAX logical offsets. Buffers are not a KV cache tier. A slot
     whose completion could not be recorded, whose query raised, or whose DMA
-    was not observed complete within ``event_timeout_s`` (or
-    ``close_timeout_s`` at close) is retired and its buffer kept until process
-    exit in the module-level ``_RETIRED_BUFFERS`` registry, which outlives the
-    pool.
+    a waiting acquisition did not observe complete within ``event_timeout_s``
+    of starting to wait (or within ``close_timeout_s`` at close) is retired
+    and its buffer kept until process exit in the module-level
+    ``_RETIRED_BUFFERS`` registry, which outlives the pool.
     """
 
     def __init__(
@@ -259,16 +261,17 @@ class StagedRetrievePool:
     def close(self) -> None:
         """Reject new sessions, drain CPU/GPU work for a bounded time, release.
 
-        Active sessions are waited for without a timeout: a session now ends
+        Active sessions are waited for without a timeout: a session ends
         right after its last batch is recorded, and its only wait, a slot
-        acquisition, is bounded by the event timeout. In-flight DMA is then
-        polled for up to ``close_timeout_s``; slots still in flight are
-        quarantined (retired, buffer kept, registry) with a warning, so close
-        cannot hang on a device that never fires its completion. Retired
-        slots keep their buffers for the process lifetime because their DMA
-        completion was never proven; this is logged, not raised. The
-        module-level registry keeps them after the pool itself is gone. A
-        second close is idempotent.
+        acquisition, is bounded by ``slots * event_timeout_s`` (each in-flight
+        slot it has to retire costs one full event timeout window). In-flight
+        DMA is then polled for up to ``close_timeout_s``; slots still in
+        flight are quarantined (retired, buffer kept, registry) with a
+        warning, so close cannot hang on a device that never fires its
+        completion. Retired slots keep their buffers for the process lifetime
+        because their DMA completion was never proven; this is logged, not
+        raised. The module-level registry keeps them after the pool itself is
+        gone. A second close is idempotent.
         """
         with self._close_lock:
             with self._condition:
@@ -422,9 +425,7 @@ class StagedRetrievePool:
                         ) from error
                     with self._condition:
                         now = time.monotonic()
-                        self._in_flight[slot] = _InFlight(
-                            handle, now, now + self._event_timeout_s
-                        )
+                        self._in_flight[slot] = _InFlight(handle, now)
                         registered = True
                         self._condition.notify_all()
             finally:
@@ -441,9 +442,9 @@ class StagedRetrievePool:
         """Return a free slot, reclaiming or waiting on in-flight DMA first.
 
         The wait polls the oldest in-flight slot outside the condition, so a
-        completion that never fires retires that slot after the event timeout
-        instead of blocking every pipeline; the loop then continues on the
-        remaining slots.
+        completion that never fires retires that slot one event timeout after
+        this wait began instead of blocking every pipeline; the loop then
+        continues on the remaining slots, each with a fresh window.
         """
         waited = False
         while True:
@@ -482,12 +483,17 @@ class StagedRetrievePool:
             self._wait_for_completion(slot, flight)
 
     def _wait_for_completion(self, slot: int, flight: _InFlight) -> None:
-        """Poll ``flight`` outside the condition until done, raised or expired.
+        """Poll ``flight`` outside the condition for one full event timeout.
 
-        A completion that raises or stays pending past its deadline retires
-        the slot, unless another thread already reclaimed or retired it. The
-        caller re-checks the pool afterwards either way.
+        The window starts here, not at record time, so slots recorded close
+        together on one stalled stream are retired one window apart, not
+        together, and a stall that clears later costs at most the slot whose
+        window actually expired. The wait ends early when the flight
+        completes, when its query raises (the slot is retired), or when
+        another thread already reclaimed or retired the slot; the caller
+        re-checks the pool either way.
         """
+        deadline = time.monotonic() + self._event_timeout_s
         while True:
             try:
                 done = flight.handle.query()
@@ -496,7 +502,10 @@ class StagedRetrievePool:
                 return
             if done:
                 return
-            if time.monotonic() >= flight.deadline:
+            with self._condition:
+                if self._in_flight.get(slot) is not flight:
+                    return
+            if time.monotonic() >= deadline:
                 self._retire_in_flight(
                     slot,
                     flight,

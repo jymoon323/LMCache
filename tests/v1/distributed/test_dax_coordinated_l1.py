@@ -2385,7 +2385,14 @@ def test_staged_retrieve_config_preserves_layout_and_rejects_no_flush() -> None:
             with pytest.raises(ValueError, match=name):
                 replace(staged, **{name: value})
         assert getattr(replace(staged, **{name: 5}), name) == 5
-        assert getattr(replace(staged, **{name: 0.5}), name) == 0.5
+    close = replace(staged, staged_retrieve_close_timeout_s=0.5)
+    assert close.staged_retrieve_close_timeout_s == 0.5
+    for value in (0.5, 0.999):
+        with pytest.raises(ValueError, match="event_timeout_s must be at least 1"):
+            replace(staged, staged_retrieve_event_timeout_s=value)
+    for value in (1, 1.0):
+        event = replace(staged, staged_retrieve_event_timeout_s=value)
+        assert event.staged_retrieve_event_timeout_s == value
 
 
 def _staged_storage(

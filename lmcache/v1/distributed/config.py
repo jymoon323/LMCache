@@ -300,8 +300,12 @@ class DaxCoordinatedL1Config:
     """Native libc CPU copy workers shared by all local ranks/pipelines."""
 
     staged_retrieve_event_timeout_s: float = 30.0
-    """Seconds a recorded bounce DMA completion may stay pending while a
-    pipeline waits for that slot; past that the slot is retired as unknown.
+    """Seconds a pipeline waiting for a bounce slot polls that slot's recorded
+    DMA completion before retiring the slot as unknown. The window starts when
+    the wait starts, so each waited slot gets a full window and a stream that
+    stays stalled loses one slot per window. Must be at least 1.0; the 30.0
+    default is the recommended value, and a value near the floor can lose a
+    slot to one long engine step.
     """
 
     staged_retrieve_close_timeout_s: float = 30.0
@@ -353,6 +357,11 @@ class DaxCoordinatedL1Config:
             timeout = getattr(self, name)
             if type(timeout) not in (int, float) or timeout <= 0:
                 raise ValueError(f"DAX-Coordinated L1 {name} must be a positive number")
+        if self.staged_retrieve_event_timeout_s < 1.0:
+            raise ValueError(
+                "DAX-Coordinated L1 staged_retrieve_event_timeout_s must be at "
+                "least 1 second"
+            )
         if self.staged_retrieve and self.skip_payload_flush:
             raise ValueError("staged_retrieve requires skip_payload_flush=false")
         if (
