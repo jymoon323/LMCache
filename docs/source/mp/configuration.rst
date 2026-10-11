@@ -951,8 +951,9 @@ close, so a ``staged_retrieve_slot_bytes`` that is not a power of two can pin
 up to about twice the configured capacity. Buffers are transient transfer
 storage, not a DRAM KV cache.
 
-Each KV object must fit in one slot; increase ``staged_retrieve_slot_bytes``
-when the model's object is larger.
+Each KV object must fit in one slot: model registration is refused with a
+``ValueError`` naming both sizes when it does not, so raise
+``staged_retrieve_slot_bytes`` or disable staging before starting the engine.
 A pipeline packs as many objects as fit into one slot, copies them with the
 native workers, enqueues the H2D copy from that slot and records a completion
 event on the cache stream; it then takes another free slot for the next batch

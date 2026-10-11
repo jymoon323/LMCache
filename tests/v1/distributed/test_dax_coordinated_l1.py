@@ -718,6 +718,45 @@ def test_oversized_model_is_rejected_before_metadata_mapping(
     region.close.assert_called_once()
 
 
+def test_staged_slot_smaller_than_model_object_is_rejected_at_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged slot that cannot hold one model object refuses the layout."""
+    region = Mock()
+    monkeypatch.setattr(
+        "lmcache.v1.distributed.dax_coordinated_l1.devdax_client.DaxCoordinatedL1Region",
+        Mock(return_value=region),
+    )
+    slot_bytes = (32 << 20) - 64  # _model_layout() is a 32 MiB object
+    client = DaxCoordinatedL1Client(
+        _base_config(
+            devdax_path="/nonexistent/lmcache-test-dax",
+            staged_retrieve=True,
+            staged_retrieve_slot_bytes=slot_bytes,
+        ),
+        L1MemoryManagerConfig(
+            devdax_path="/nonexistent/lmcache-test-dax",
+            size_in_bytes=1 << 30,
+            use_lazy=False,
+            shm_name="",
+        ),
+    )
+    for _ in range(2):  # the client stays unbound, so a retry is checked again
+        with pytest.raises(ValueError, match="staged_retrieve_slot_bytes") as error:
+            client.initialize_model_layouts(_MODEL, 1, 256, [_model_layout()])
+        assert f"slot_bytes={slot_bytes} " in str(error.value)
+        assert f"object of {32 << 20} bytes" in str(error.value)
+    assert not client.initialized
+    region.map_metadata.assert_not_called()
+    # Deferred attach cannot bypass the check: no geometry was bound.
+    key = _key(0, 1)
+    assert client.reserve_read([key])[key].result is Raw.NOT_FOUND
+    with pytest.raises(RuntimeError, match="not initialized"):
+        client.reserve_write([key], _model_layout())
+    client.close()
+    region.close.assert_called_once()
+
+
 def test_storage_manager_exposes_dax_backend_without_binding_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2438,6 +2477,55 @@ def _staged_retrieve(module: LMCacheDrivenTransferModule) -> tuple[bytes, bool]:
         [[0, 1, 2, 3]],
         b"producer",
     )
+
+
+@pytest.mark.no_shared_allocator
+def test_staged_slot_sizing_checked_against_registered_object(
+    emulated_devices: tuple,
+) -> None:
+    """Real native cores: a slot of exactly one object registers, a smaller
+    slot is refused before and after participant 0 formats, and the slot
+    size is ignored without staging."""
+    placement, _, _ = emulated_devices
+    owner = _client(_config(placement))
+    small = (1 << 20) - 64  # _layout() is a 1 MiB object
+    try:
+        with closing(
+            _staged_storage(placement, staged_retrieve_slot_bytes=small)
+        ) as storage:
+            backend = storage.dax_coordinated_l1_backend
+            assert backend is not None
+            with pytest.raises(ValueError, match="staged_retrieve_slot_bytes"):
+                backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+            assert not backend.client.initialized
+        assert owner.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+        with closing(
+            _staged_storage(placement, staged_retrieve_slot_bytes=1 << 20)
+        ) as storage:
+            backend = storage.dax_coordinated_l1_backend
+            assert backend is not None
+            assert backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+            assert backend.client.initialized
+        with closing(
+            _staged_storage(placement, staged_retrieve_slot_bytes=small)
+        ) as storage:
+            backend = storage.dax_coordinated_l1_backend
+            assert backend is not None
+            with pytest.raises(ValueError, match="staged_retrieve_slot_bytes"):
+                backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+            assert not backend.client.initialized
+        with closing(
+            _staged_storage(
+                placement, staged_retrieve=False, staged_retrieve_slot_bytes=64
+            )
+        ) as storage:
+            backend = storage.dax_coordinated_l1_backend
+            assert backend is not None
+            assert backend.client.initialize_model_layouts(_MODEL, 4, 256, [_layout()])
+            assert backend.staged_retrieve is None
+    finally:
+        gc.collect()
+        owner.close()
 
 
 @pytest.mark.no_shared_allocator

@@ -89,7 +89,7 @@ attach memcheck, timeout and logging are host-local settings.
 | `rank_placement` | Required for TP=1..8; all device paths, metadata reservations and payload ranges live in `regions`; see [TP support](#tp-support) |
 | `staged_retrieve` | `false`; host-local opt-in to [staged retrieval](#staged-retrieval-opt-in); requires `skip_payload_flush=false` |
 | `staged_retrieve_slots` | `4`; pinned DRAM bounce slots per MP server, allocated lazily |
-| `staged_retrieve_slot_bytes` | `268435456` (256 MiB); bytes per slot; every KV object must fit in one slot (allocator rounds to a power of two) |
+| `staged_retrieve_slot_bytes` | `268435456` (256 MiB); bytes per slot; every KV object must fit in one slot (allocator rounds to a power of two); validated at model registration |
 | `staged_retrieve_copy_threads` | `4`; native libc copy workers per MP server |
 | `staged_retrieve_event_timeout_s` | `30.0`; seconds a recorded bounce DMA completion may stay pending while a pipeline waits for that slot before it is retired |
 | `staged_retrieve_close_timeout_s` | `30.0`; seconds backend close waits for in-flight bounce DMA before quarantining the remaining slots |

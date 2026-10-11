@@ -288,7 +288,9 @@ class DaxCoordinatedL1Config:
     """Maximum simultaneous pinned bounce buffers (allocated lazily)."""
 
     staged_retrieve_slot_bytes: int = 256 * 1024 * 1024
-    """Bytes per bounce buffer; each KV object must fit in one buffer.
+    """Bytes per bounce buffer; each KV object must fit in one buffer, which
+    is checked when the model layout is registered (a larger object refuses
+    the registration with ValueError).
     The payload memory bound is slots * slot_bytes before the PyTorch host
     allocator rounds each slot up to a power of two, independent of request
     size.

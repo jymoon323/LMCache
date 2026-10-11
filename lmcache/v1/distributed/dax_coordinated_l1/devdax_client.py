@@ -175,7 +175,10 @@ class DaxCoordinatedL1Client:
         """Bind the payload arena once to one admitted runtime model layout.
 
         Returns ``False`` on nonzero participants while participant 0 has not yet
-        formatted fresh metadata. A later request retries the attach.
+        formatted fresh metadata. A later request retries the attach. With
+        ``staged_retrieve`` the model object must fit one
+        ``staged_retrieve_slot_bytes`` bounce slot; a larger object is rejected
+        here, before any metadata is mapped.
         """
         with self._lifecycle_lock:
             if self._closed:
@@ -189,6 +192,18 @@ class DaxCoordinatedL1Client:
             )
             if self._model_profile is None:
                 geometry = resolve_payload_geometry(self._config, profile.payload_bytes)
+                if (
+                    self._config.staged_retrieve
+                    and geometry.model_payload_bytes
+                    > self._config.staged_retrieve_slot_bytes
+                ):
+                    raise ValueError(
+                        "DAX-Coordinated L1 staged_retrieve_slot_bytes="
+                        f"{self._config.staged_retrieve_slot_bytes} cannot hold one "
+                        f"{model_name} object of {geometry.model_payload_bytes} bytes "
+                        f"(payload slot {geometry.payload_slot_bytes} bytes); raise "
+                        "staged_retrieve_slot_bytes or disable staged_retrieve"
+                    )
                 self._model_profile = profile
                 self._geometry = geometry
             elif profile != self._model_profile:
